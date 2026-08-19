@@ -3,10 +3,11 @@
     # Shared
     target_frame: base_link
 
-pcl_obstacle_node:
+cloud_workspace_node:
   ros__parameters:
     depth_topic: /camera/depth/image_raw
     camera_info_topic: /camera/color/camera_info
+    output_cloud_topic: /perception/cloud_workspace
     target_frame: base_link
     depth_stride: 4
     min_depth_m: 0.2
@@ -16,6 +17,12 @@ pcl_obstacle_node:
     passthrough_z_min: -1.0
     passthrough_z_max: 2.0
     voxel_leaf_m: 0.05
+    tf_timeout_sec: 0.1
+
+pcl_obstacle_node:
+  ros__parameters:
+    input_cloud_topic: /perception/cloud_workspace
+    target_frame: base_link
     enable_sor: false
     sor_mean_k: 20
     sor_stddev: 2.0
@@ -27,7 +34,6 @@ pcl_obstacle_node:
     cluster_min_points: 20
     cluster_max_points: 25000
     max_clusters: 30
-    tf_timeout_sec: 0.1
 
 bev_node:
   ros__parameters:

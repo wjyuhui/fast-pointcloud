@@ -7,26 +7,29 @@ orbbec_camera（官方）
     │  + bringup: static TF  base_link -> camera_link
     ├──────────────────────┐
     ▼                      ▼
-┌─────────────────┐   ┌──────────────────┐
-│ yolo_3d_node    │   │ pcl_obstacle_node│
-│ 2D检测 + ROI抬升 │   │ depth稀疏建点/   │
-│ → Detection3D   │   │ 裁剪/体素/SOR/   │
-│                 │   │ RANSAC/聚类/AABB │
-└────────┬────────┘   └────────┬─────────┘
-         │ 语义旁路             │ 几何主链路
-         ▼                     ▼
-   detections_3d          cloud_obstacles
-   markers/detections          │
-                               ▼
-                         ┌──────────────────┐
-                         │ bev_node         │
-                         │ OccupancyGrid +  │
-                         │ Marker           │
-                         └──────────────────┘
+┌─────────────────┐   ┌──────────────────────┐
+│ yolo_3d_node    │   │ cloud_workspace_node │
+│ 2D检测 + ROI抬升 │   │ 稀疏反投影/TF/       │
+│ → Detection3D   │   │ 裁剪/体素            │
+└────────┬────────┘   └──────────┬───────────┘
+         │ 语义旁路              │ cloud_workspace
+         ▼                       ▼
+   detections_3d          ┌──────────────────┐
+   markers/detections     │ pcl_obstacle_node│
+                          │ SOR/RANSAC/聚类/ │
+                          │ AABB             │
+                          └────────┬─────────┘
+                                   │ cloud_obstacles
+                                   ▼
+                             ┌──────────────────┐
+                             │ bev_node         │
+                             │ OccupancyGrid +  │
+                             │ Marker           │
+                             └──────────────────┘
 
 包结构（src/）：
   rgbd_perception_msgs  自定义消息
-  rgbd_pcl              pcl_obstacle_node
+  rgbd_pcl              cloud_workspace_node + pcl_obstacle_node
   rgbd_bev              bev_node
   rgbd_detection        yolo_3d_node (ONNX Runtime + OpenCV 预处理)
   rgbd_bringup          launch / config
@@ -51,9 +54,15 @@ yolo_3d_node：
     /perception/markers/detections
   （语义旁路：跟人/停靠/测距；不进 BEV）
 
+cloud_workspace_node：
+  订阅: /camera/depth/image_raw + /camera/color/camera_info + TF
+  （stride 稀疏反投影 → TF → PassThrough x/z → VoxelGrid）
+  发布:
+    /perception/cloud_workspace          # base_link，含地面
+
 pcl_obstacle_node：
-  订阅: /camera/depth/image_raw + /camera/color/camera_info
-  （stride 稀疏反投影 → TF → 裁剪/体素/地面/聚类）
+  订阅: /perception/cloud_workspace
+  （可选 SOR → 地面分割 → 欧式聚类 → AABB）
   发布:
     /perception/obstacles
     /perception/cloud_obstacles
@@ -97,6 +106,11 @@ source /home/yuhui/ros2_ws/setup_local_deps.bash
 source install/setup.bash
 ros2 launch rgbd_bringup perception.launch.py
 
+启动包非实时程序：
+cd /home/yuhui/ros2_ws
+source /home/yuhui/ros2_ws/setup_local_deps.bash
+source install/setup.bash
+ros2 launch rgbd_bringup perception.launch.py use_orbbec:=false
 
 ────────────────────────────────────────
 录制算法需要的包：

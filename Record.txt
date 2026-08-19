@@ -139,3 +139,21 @@
 
 26.08.19：
     > 现在的最新计划是，在已有的流水线中进行（流水线还会改动，应该不会大改了）profiling → 找瓶颈 → 并行设计 → SIMD → cache/内存优化 → benchmark
+
+    1. 点云可能别的位置还需要，所以不能只发布depth, 需要添加一个中间节点，接受depth 发布稀疏后的点云数据
+
+    2. 我对该项目的优化评测规划是：
+        1. Baseline + Profiling （不上cache data管理 + openmp + neon, 但是是否需要先做基本优化呢？）
+        2. Data-oriented optimization
+        3. OpenMP
+        4. NEON
+
+        3 + 4 最好找几个耗时的PCL算子，重构一下，AI推荐如下，后面需要实际测试：
+        模块	                    可能耗时	 OpenMP	  NEON	     值不值得深入
+        反投影 + Transform + ROI	 ★★★★	    ★★★★★	 ★★★★★	    非常值得
+        VoxelGrid	                ★★★★	   ★★★★	      ★★	    值得
+        RANSAC 地面分割	       ★★★★～★★★★★	     ★★★★★	  ★★★★★	     非常值得
+        KdTree + Euclidean Cluster	★★★★★	     ★★     	★	    耗时但不适合硬上 SIMD
+        PassThrough	                   ★	    ★★★★★	  ★★★★★	    太简单，不适合当核心亮点
+        Cluster bbox/center	           ★     	★★★        ★★★★     可以顺手优化
+        PointCloud2 转换	          ★★         不太合适 	不太合适  更偏数据流优化

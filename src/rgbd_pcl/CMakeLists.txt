@@ -31,6 +31,18 @@ include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
 
+add_executable(cloud_workspace_node src/cloud_workspace_node.cpp)
+target_include_directories(cloud_workspace_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+)
+ament_target_dependencies(cloud_workspace_node
+  rclcpp sensor_msgs geometry_msgs
+  tf2 tf2_ros tf2_eigen pcl_conversions
+)
+target_link_libraries(cloud_workspace_node ${PCL_LIBRARIES})
+
 add_executable(pcl_obstacle_node src/pcl_obstacle_node.cpp)
 target_include_directories(pcl_obstacle_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -39,10 +51,10 @@ target_include_directories(pcl_obstacle_node PUBLIC
 )
 ament_target_dependencies(pcl_obstacle_node
   rclcpp sensor_msgs visualization_msgs geometry_msgs
-  tf2 tf2_ros tf2_eigen tf2_sensor_msgs pcl_conversions rgbd_perception_msgs
+  pcl_conversions rgbd_perception_msgs
 )
 target_link_libraries(pcl_obstacle_node ${PCL_LIBRARIES})
 
-install(TARGETS pcl_obstacle_node DESTINATION lib/${PROJECT_NAME})
+install(TARGETS cloud_workspace_node pcl_obstacle_node DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

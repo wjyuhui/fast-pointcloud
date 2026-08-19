@@ -1,8 +1,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
-#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
@@ -11,9 +9,7 @@
 #include <Eigen/Geometry>
 #include <geometry_msgs/msg/point.hpp>
 #include <pcl/filters/extract_indices.h>
-#include <pcl/filters/passthrough.h>
 #include <pcl/filters/statistical_outlier_removal.h>
-#include <pcl/filters/voxel_grid.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/segmentation/extract_clusters.h>
@@ -22,12 +18,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rgbd_perception_msgs/msg/obstacle.hpp>
 #include <rgbd_perception_msgs/msg/obstacle_array.hpp>
-#include <sensor_msgs/msg/camera_info.hpp>
-#include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <tf2_eigen/tf2_eigen.hpp>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
@@ -38,21 +29,10 @@ class PclObstacleNode : public rclcpp::Node
 {
 public:
   PclObstacleNode()
-  : Node("pcl_obstacle_node"),
-    tf_buffer_(this->get_clock()),
-    tf_listener_(tf_buffer_)
+  : Node("pcl_obstacle_node")
   {
-    declare_parameter<std::string>("depth_topic", "/camera/depth/image_raw");
-    declare_parameter<std::string>("camera_info_topic", "/camera/color/camera_info");
+    declare_parameter<std::string>("input_cloud_topic", "/perception/cloud_workspace");
     declare_parameter<std::string>("target_frame", "base_link");
-    declare_parameter<int>("depth_stride", 4);
-    declare_parameter<double>("min_depth_m", 0.2);
-    declare_parameter<double>("max_depth_m", 5.0);
-    declare_parameter<double>("passthrough_x_min", 0.2);
-    declare_parameter<double>("passthrough_x_max", 5.0);
-    declare_parameter<double>("passthrough_z_min", -1.0);
-    declare_parameter<double>("passthrough_z_max", 2.0);
-    declare_parameter<double>("voxel_leaf_m", 0.05);
     declare_parameter<bool>("enable_sor", false);
     declare_parameter<int>("sor_mean_k", 20);
     declare_parameter<double>("sor_stddev", 2.0);
@@ -64,22 +44,14 @@ public:
     declare_parameter<int>("cluster_min_points", 20);
     declare_parameter<int>("cluster_max_points", 25000);
     declare_parameter<int>("max_clusters", 30);
-    declare_parameter<double>("tf_timeout_sec", 0.1);
 
-    depth_topic_ = get_parameter("depth_topic").as_string();
-    info_topic_ = get_parameter("camera_info_topic").as_string();
+    input_topic_ = get_parameter("input_cloud_topic").as_string();
     target_frame_ = get_parameter("target_frame").as_string();
 
     rclcpp::SensorDataQoS qos;
-    info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-      info_topic_, qos,
-      [this](const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
-        camera_info_ = *msg;
-        have_info_ = true;
-      });
-    depth_sub_ = create_subscription<sensor_msgs::msg::Image>(
-      depth_topic_, qos,
-      std::bind(&PclObstacleNode::depthCallback, this, std::placeholders::_1));
+    cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+      input_topic_, qos,
+      std::bind(&PclObstacleNode::cloudCallback, this, std::placeholders::_1));
 
     obstacles_pub_ = create_publisher<rgbd_perception_msgs::msg::ObstacleArray>(
       "/perception/obstacles", 10);
@@ -91,195 +63,50 @@ public:
       "/perception/markers/obstacles", 10);
 
     RCLCPP_INFO(get_logger(),
-      "pcl_obstacle_node depth=%s info=%s -> %s (sparse backproject)",
-      depth_topic_.c_str(), info_topic_.c_str(), target_frame_.c_str());
+      "pcl_obstacle_node cloud=%s frame=%s (ground/cluster)",
+      input_topic_.c_str(), target_frame_.c_str());
   }
 
 private:
-  void depthCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+  void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
     const auto t0 = std::chrono::steady_clock::now();
 
-    if (!have_info_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Waiting for camera_info on %s",
-        info_topic_.c_str());
+    CloudT::Ptr cloud(new CloudT);
+    pcl::fromROSMsg(*msg, *cloud);
+    if (cloud->empty()) {
       return;
     }
 
-    CloudT::Ptr cloud_cam(new CloudT);
-    if (!depthToCloudSparse(*msg, *cloud_cam) || cloud_cam->empty()) {
-      return;
-    }
+    const std::string frame = msg->header.frame_id.empty()
+      ? target_frame_
+      : msg->header.frame_id;
 
-    const std::string optical_frame = camera_info_.header.frame_id.empty()
-      ? msg->header.frame_id
-      : camera_info_.header.frame_id;
-
-    CloudT::Ptr cloud_base(new CloudT);
-    if (!transformCloud(*cloud_cam, optical_frame, msg->header.stamp, *cloud_base)) {
-      return;
-    }
-
-    // Passthrough in base_link: x forward, z up
-    CloudT::Ptr cloud_cut(new CloudT);
-    {
-      pcl::PassThrough<PointT> pass;
-      pass.setInputCloud(cloud_base);
-      pass.setFilterFieldName("x");
-      pass.setFilterLimits(
-        get_parameter("passthrough_x_min").as_double(),
-        get_parameter("passthrough_x_max").as_double());
-      pass.filter(*cloud_cut);
-
-      CloudT::Ptr tmp(new CloudT);
-      pass.setInputCloud(cloud_cut);
-      pass.setFilterFieldName("z");
-      pass.setFilterLimits(
-        get_parameter("passthrough_z_min").as_double(),
-        get_parameter("passthrough_z_max").as_double());
-      pass.filter(*tmp);
-      cloud_cut.swap(tmp);
-    }
-
-    CloudT::Ptr cloud_voxel(new CloudT);
-    {
-      pcl::VoxelGrid<PointT> vg;
-      vg.setInputCloud(cloud_cut);
-      const float leaf = static_cast<float>(get_parameter("voxel_leaf_m").as_double());
-      vg.setLeafSize(leaf, leaf, leaf);
-      vg.filter(*cloud_voxel);
-    }
-
-    if (get_parameter("enable_sor").as_bool() && !cloud_voxel->empty()) {
+    if (get_parameter("enable_sor").as_bool()) {
       CloudT::Ptr cloud_sor(new CloudT);
       pcl::StatisticalOutlierRemoval<PointT> sor;
-      sor.setInputCloud(cloud_voxel);
+      sor.setInputCloud(cloud);
       sor.setMeanK(get_parameter("sor_mean_k").as_int());
       sor.setStddevMulThresh(get_parameter("sor_stddev").as_double());
       sor.filter(*cloud_sor);
-      cloud_voxel.swap(cloud_sor);
+      cloud.swap(cloud_sor);
     }
 
     CloudT::Ptr obstacles(new CloudT);
     CloudT::Ptr ground(new CloudT);
-    segmentGround(cloud_voxel, obstacles, ground);
+    segmentGround(cloud, obstacles, ground);
 
-    publishCloud(cloud_obstacles_pub_, obstacles, msg->header.stamp, target_frame_);
-    publishCloud(cloud_ground_pub_, ground, msg->header.stamp, target_frame_);
+    publishCloud(cloud_obstacles_pub_, obstacles, msg->header.stamp, frame);
+    publishCloud(cloud_ground_pub_, ground, msg->header.stamp, frame);
 
     auto clusters = euclideanCluster(obstacles);
-    publishObstacles(clusters, msg->header.stamp);
+    publishObstacles(clusters, msg->header.stamp, frame);
 
     const auto ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
     RCLCPP_DEBUG(get_logger(),
-      "pcl pipeline %.1f ms, cam_pts=%zu obstacles=%zu clusters=%zu",
-      ms, cloud_cam->size(), obstacles->size(), clusters.size());
-  }
-
-  bool depthToCloudSparse(const sensor_msgs::msg::Image & depth, CloudT & cloud)
-  {
-    const int stride = std::max(1, static_cast<int>(get_parameter("depth_stride").as_int()));
-    const float zmin = static_cast<float>(get_parameter("min_depth_m").as_double());
-    const float zmax = static_cast<float>(get_parameter("max_depth_m").as_double());
-    const double fx = camera_info_.k[0];
-    const double fy = camera_info_.k[4];
-    const double cx = camera_info_.k[2];
-    const double cy = camera_info_.k[5];
-    if (!(fx > 1e-6 && fy > 1e-6)) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Invalid camera_info intrinsics");
-      return false;
-    }
-
-    const int width = static_cast<int>(depth.width);
-    const int height = static_cast<int>(depth.height);
-    if (width <= 0 || height <= 0 || depth.data.empty()) {
-      return false;
-    }
-
-    cloud.clear();
-    cloud.reserve(static_cast<size_t>((width / stride) * (height / stride)));
-
-    auto push_z = [&](int u, int v, float z) {
-      if (!std::isfinite(z) || z < zmin || z > zmax) {
-        return;
-      }
-      PointT p;
-      p.x = static_cast<float>((static_cast<double>(u) - cx) * static_cast<double>(z) / fx);
-      p.y = static_cast<float>((static_cast<double>(v) - cy) * static_cast<double>(z) / fy);
-      p.z = z;
-      cloud.push_back(p);
-    };
-
-    if (depth.encoding == "16UC1" || depth.encoding == "mono16") {
-      if (depth.step < static_cast<size_t>(width) * sizeof(uint16_t)) {
-        return false;
-      }
-      for (int v = 0; v < height; v += stride) {
-        const auto * row = reinterpret_cast<const uint16_t *>(
-          depth.data.data() + static_cast<size_t>(v) * depth.step);
-        for (int u = 0; u < width; u += stride) {
-          push_z(u, v, static_cast<float>(row[u]) * 0.001f);
-        }
-      }
-    } else if (depth.encoding == "32FC1") {
-      if (depth.step < static_cast<size_t>(width) * sizeof(float)) {
-        return false;
-      }
-      for (int v = 0; v < height; v += stride) {
-        const auto * row = reinterpret_cast<const float *>(
-          depth.data.data() + static_cast<size_t>(v) * depth.step);
-        for (int u = 0; u < width; u += stride) {
-          push_z(u, v, row[u]);
-        }
-      }
-    } else {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Unsupported depth encoding: %s", depth.encoding.c_str());
-      return false;
-    }
-
-    cloud.width = cloud.size();
-    cloud.height = 1;
-    cloud.is_dense = true;
-    return !cloud.empty();
-  }
-
-  bool transformCloud(
-    const CloudT & cloud_in, const std::string & frame_in,
-    const rclcpp::Time & stamp, CloudT & cloud_out)
-  {
-    cloud_out.clear();
-    if (frame_in == target_frame_) {
-      cloud_out = cloud_in;
-      return true;
-    }
-
-    geometry_msgs::msg::TransformStamped tf;
-    try {
-      tf = tf_buffer_.lookupTransform(
-        target_frame_, frame_in, stamp,
-        tf2::durationFromSec(get_parameter("tf_timeout_sec").as_double()));
-    } catch (const tf2::TransformException & ex) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "TF %s <- %s failed: %s", target_frame_.c_str(), frame_in.c_str(), ex.what());
-      return false;
-    }
-
-    const Eigen::Affine3d T = tf2::transformToEigen(tf.transform);
-    cloud_out.reserve(cloud_in.size());
-    for (const auto & p : cloud_in.points) {
-      const Eigen::Vector3d q = T * Eigen::Vector3d(p.x, p.y, p.z);
-      PointT o;
-      o.x = static_cast<float>(q.x());
-      o.y = static_cast<float>(q.y());
-      o.z = static_cast<float>(q.z());
-      cloud_out.push_back(o);
-    }
-    cloud_out.width = cloud_out.size();
-    cloud_out.height = 1;
-    cloud_out.is_dense = true;
-    return true;
+      "pcl pipeline %.1f ms, in_pts=%zu obstacles=%zu clusters=%zu",
+      ms, cloud->size(), obstacles->size(), clusters.size());
   }
 
   void splitByHeight(
@@ -421,11 +248,13 @@ private:
     pub->publish(msg);
   }
 
-  void publishObstacles(const std::vector<CloudT::Ptr> & clusters, const rclcpp::Time & stamp)
+  void publishObstacles(
+    const std::vector<CloudT::Ptr> & clusters, const rclcpp::Time & stamp,
+    const std::string & frame)
   {
     rgbd_perception_msgs::msg::ObstacleArray arr;
     arr.header.stamp = stamp;
-    arr.header.frame_id = target_frame_;
+    arr.header.frame_id = frame;
 
     visualization_msgs::msg::MarkerArray markers;
     visualization_msgs::msg::Marker del;
@@ -488,15 +317,9 @@ private:
     markers_pub_->publish(markers);
   }
 
-  std::string depth_topic_;
-  std::string info_topic_;
+  std::string input_topic_;
   std::string target_frame_;
-  bool have_info_{false};
-  sensor_msgs::msg::CameraInfo camera_info_;
-  tf2_ros::Buffer tf_buffer_;
-  tf2_ros::TransformListener tf_listener_;
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr info_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Publisher<rgbd_perception_msgs::msg::ObstacleArray>::SharedPtr obstacles_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_obstacles_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_ground_pub_;

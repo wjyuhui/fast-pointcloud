@@ -3,7 +3,7 @@
 <package format="3">
   <name>rgbd_pcl</name>
   <version>0.1.0</version>
-  <description>PCL obstacle pipeline: filter, ground, cluster, AABB.</description>
+  <description>Workspace cloud frontend plus PCL obstacle pipeline: ground, cluster, AABB.</description>
   <maintainer email="yuhui@todo.todo">yuhui</maintainer>
   <license>Apache-2.0</license>
 

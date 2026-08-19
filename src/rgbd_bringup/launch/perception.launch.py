@@ -41,6 +41,16 @@ def launch_setup(context, *args, **kwargs):
     nodes.append(
         Node(
             package='rgbd_pcl',
+            executable='cloud_workspace_node',
+            name='cloud_workspace_node',
+            output='screen',
+            parameters=[params_file],
+        )
+    )
+
+    nodes.append(
+        Node(
+            package='rgbd_pcl',
             executable='pcl_obstacle_node',
             name='pcl_obstacle_node',
             output='screen',
@@ -86,7 +96,7 @@ def launch_setup(context, *args, **kwargs):
             launch_arguments={
                 'depth_registration': 'true',
                 'align_mode': 'SW',
-                # Driver does not publish dense PointCloud2; pcl builds sparse cloud from depth.
+                # Driver does not publish dense PointCloud2; workspace node builds it from depth.
                 'enable_point_cloud': 'false',
                 'enable_colored_point_cloud': 'false',
                 'publish_tf': 'true',
