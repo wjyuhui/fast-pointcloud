@@ -1,0 +1,68 @@
+/**:
+  ros__parameters:
+    # Shared
+    target_frame: base_link
+
+pcl_obstacle_node:
+  ros__parameters:
+    depth_topic: /camera/depth/image_raw
+    camera_info_topic: /camera/color/camera_info
+    target_frame: base_link
+    depth_stride: 4
+    min_depth_m: 0.2
+    max_depth_m: 5.0
+    passthrough_x_min: 0.2
+    passthrough_x_max: 5.0
+    passthrough_z_min: -1.0
+    passthrough_z_max: 2.0
+    voxel_leaf_m: 0.05
+    enable_sor: false
+    sor_mean_k: 20
+    sor_stddev: 2.0
+    ground_method: ransac   # ransac | height  (ransac fails -> height fallback)
+    ground_distance_thresh_m: 0.05
+    ransac_max_iterations: 300
+    height_thresh_m: 0.15
+    cluster_tolerance_m: 0.15
+    cluster_min_points: 20
+    cluster_max_points: 25000
+    max_clusters: 30
+    tf_timeout_sec: 0.1
+
+bev_node:
+  ros__parameters:
+    input_cloud_topic: /perception/cloud_obstacles
+    frame_id: base_link
+    x_min_m: 0.0
+    x_max_m: 5.0
+    y_min_m: -2.5
+    y_max_m: 2.5
+    resolution_m: 0.05
+    z_min_m: 0.05
+    z_max_m: 1.8
+    occupied_count: 2
+    publish_markers: true
+
+yolo_3d_node:
+  ros__parameters:
+    # Filled by launch with share path if empty
+    model_path: ""
+    enable_detection: true
+    conf_thresh: 0.35
+    iou_thresh: 0.45
+    imgsz: 640
+    class_whitelist: [0, 56, 57, 59, 60, 62, 63]
+    depth_percentile: 50.0
+    trim_low: 0.1
+    trim_high: 0.9
+    min_valid_pixels: 30
+    center_crop_ratio: 0.6
+    min_depth_m: 0.2
+    max_depth_m: 5.0
+    target_frame: base_link
+    color_topic: /camera/color/image_raw
+    depth_topic: /camera/depth/image_raw
+    camera_info_topic: /camera/color/camera_info
+
+# Camera mount TF is published by perception.launch.py (static_transform_publisher),
+# not via this params file (ROS2 params YAML requires ros__parameters under each node).
