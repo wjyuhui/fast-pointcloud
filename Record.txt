@@ -169,3 +169,31 @@
         tf = tf_buffer_.lookupTransform(目标坐标系, 原坐标系, 当前数据的时间戳, 超时机制);
 
         转成 Eigen 矩阵，逐点相乘
+
+26.08.22:
+    1. 7个阶段：
+        1. P0： 确定 baseline
+        2. P1： 建立企业化 Profiling 和回归评测
+        3. P2： A：反投影 + Transform + ROI（不用上OpenMP Neon 时通过单个遍历做完这些） B：RANSAC 地面分割 不上OpenMP + Neon的优化
+        4. P3： OpenMP（注意RK3588S的大小核的影响） A：反投影链路并行 B：RANSAC并行
+        5. P4： NEON A：先检查自动向量化，哪些已经自动向量化了，哪些没有，并且还值得写。 B：反投影 NEON  C:RANSAC NEON
+        6. P5： ROS2系统级优化: 节点组件化，intra-process  commnication    减少PointColoud <-> PCL的重复转换 ......
+        7. P6： ARM部署与完整结果   
+
+
+
+
+
+    2. 简历计划：
+    基于 RK3588S 的图书馆服务机器人 RGB-D 行人避障系统
+    项目介绍：面向图书馆窄通道及书架转角行人突然出现的碰撞风险，基于 C++17、ROS2 Humble 和 Orbbec RGB-D 相机构建实时感知系统，实现深度反投影、TF2坐标变换、地面分割、障碍物聚类与局部BEV占用建图。
+    项目内容：1. 部署YOLOv8行人检测，通过目标ROI深度统计和坐标变换输出 base_link 下的行人三维位置，形成“几何障碍物避障主链 + 行人语义感知旁路”，行人测距误差为 * m。
+    2. 针对转角场景的感知延迟，融合反投影、Transform与ROI遍历，并采用射线缓存、近地候选RANSAC、OpenMP及AArch64 NEON优化，将RK3588S端到端p95延迟由 * ms 降至 * ms，为规划和制动模块增加 * ms 响应时间。
+    3. 基于固定rosbag和转角行人测试场景建立性能回归，统计p50/p95/p99、丢帧率及CPU/内存占用；优化后处理频率达到 * FPS、丢帧率低于 *%
+
+
+    版本	优化方案	p95延迟	加速比
+    原始基线	原始多遍点云处理	* ms	1.00×
+    标量优化	遍历融合、射线缓存、RANSAC候选集	* ms	*×
+    OpenMP	标量优化 + *线程并行	* ms	*×
+    最终版本	OpenMP + AArch64 NEON	* ms	*×

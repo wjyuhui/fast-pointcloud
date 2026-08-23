@@ -6,7 +6,5 @@ log/
 __pycache__/
 .build_log.txt
 build_log.txt
-Record.txt
 .cursor/
-system.drawio
 Readme_v0.txt
