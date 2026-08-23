@@ -68,12 +68,14 @@ public:
   }
 
 private:
+
+  // 回调函数，也是主要的工作函数，收到点云数据后，进行处理， 每一个步骤几乎封装成另一个函数在此回调函数中进行调用
   void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
     const auto t0 = std::chrono::steady_clock::now();
 
     CloudT::Ptr cloud(new CloudT);
-    pcl::fromROSMsg(*msg, *cloud);
+    pcl::fromROSMsg(*msg, *cloud);  // 从Msg中取出点云数据，存入cloud中
     if (cloud->empty()) {
       return;
     }
@@ -82,9 +84,12 @@ private:
       ? target_frame_
       : msg->header.frame_id;
 
-    if (get_parameter("enable_sor").as_bool()) {
+    if (get_parameter("enable_sor").as_bool()) {  // 如果开启SOR后，下面进行SOR操作
+      /**
+        原理：每个点看周围 K 个邻居的平均距离；整片点云统计出μ、σ；距离超过μ+倍数×σ的点丢掉。
+      */
       CloudT::Ptr cloud_sor(new CloudT);
-      pcl::StatisticalOutlierRemoval<PointT> sor;
+      pcl::StatisticalOutlierRemoval<PointT> sor;  // 仍然是创建一个滤波器（类实例），然后设置参数，然后开始过滤，结果存入新建变量中。
       sor.setInputCloud(cloud);
       sor.setMeanK(get_parameter("sor_mean_k").as_int());
       sor.setStddevMulThresh(get_parameter("sor_stddev").as_double());
@@ -94,13 +99,14 @@ private:
 
     CloudT::Ptr obstacles(new CloudT);
     CloudT::Ptr ground(new CloudT);
-    segmentGround(cloud, obstacles, ground);
+    segmentGround(cloud, obstacles, ground);  // 地面分割， 分割出地面和障碍物
 
+    // 发布地面和障碍物点云
     publishCloud(cloud_obstacles_pub_, obstacles, msg->header.stamp, frame);
     publishCloud(cloud_ground_pub_, ground, msg->header.stamp, frame);
 
-    auto clusters = euclideanCluster(obstacles);
-    publishObstacles(clusters, msg->header.stamp, frame);
+    auto clusters = euclideanCluster(obstacles);  // 欧式聚类， 将障碍物点云分割成多个聚类
+    publishObstacles(clusters, msg->header.stamp, frame);  // 发布障碍物聚类
 
     const auto ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
@@ -141,7 +147,7 @@ private:
     }
 
     const std::string method = get_parameter("ground_method").as_string();
-    if (method == "height") {
+    if (method == "height") {  // 如果选择高度分割，则调用splitByHeight函数 这个太死板了，地面不一定完美额的平，矮一点的障碍物容易被忽略
       splitByHeight(input, obstacles, ground);
       return;
     }
@@ -150,7 +156,7 @@ private:
     const float probe_z = static_cast<float>(
       std::max(0.2, get_parameter("height_thresh_m").as_double() * 2.0));
     size_t near_ground = 0;
-    for (const auto & p : input->points) {
+    for (const auto & p : input->points) {  // 判断有多少的点在地面附近
       if (p.z <= probe_z) {
         ++near_ground;
       }
@@ -163,41 +169,59 @@ private:
       splitByHeight(input, obstacles, ground);
       return;
     }
-
-    pcl::SACSegmentation<PointT> seg;
-    seg.setOptimizeCoefficients(true);
-    seg.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
-    seg.setMethodType(pcl::SAC_RANSAC);
-    seg.setDistanceThreshold(get_parameter("ground_distance_thresh_m").as_double());
-    seg.setMaxIterations(get_parameter("ransac_max_iterations").as_int());
-    Eigen::Vector3f axis(0.0f, 0.0f, 1.0f);
+    /**
+    SAC是Sample Consensus 采样一致性缩写
+    SACSegmentation 本身是一个通用框架，需要继续告诉它：
+      - 要找什么几何模型
+      - 用什么算法寻找
+      - 多远算内点
+      - 最多尝试多少次
+      - 有没有方向限制
+      - 输入点云是什么
+    */
+    pcl::SACSegmentation<PointT> seg;  // 创建分割器
+    seg.setOptimizeCoefficients(true);  // 是否优化最终平面系数  开启后地层是怎么优化的呢？
+    seg.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);  // 指定几何模型  寻找一个与指定轴线近似垂直的平面。
+    seg.setMethodType(pcl::SAC_RANSAC);  // 指定 RANSAC 算法
+    seg.setDistanceThreshold(get_parameter("ground_distance_thresh_m").as_double());  // 设置点到平面的距离阈值
+    seg.setMaxIterations(get_parameter("ransac_max_iterations").as_int());  // RANSAC 最多尝试*组随机样本。
+    Eigen::Vector3f axis(0.0f, 0.0f, 1.0f);  // 定义期望轴线
     seg.setAxis(axis);
-    seg.setEpsAngle(25.0 * M_PI / 180.0);
+    seg.setEpsAngle(25.0 * M_PI / 180.0);  // 设置最大角度误差  PCL接受的是弧度，所以需要将25转换一下
     seg.setInputCloud(input);
 
-    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
-    pcl::ModelCoefficients::Ptr coeffs(new pcl::ModelCoefficients);
+    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);  // 用于存落在平面上的点的下标
+    pcl::ModelCoefficients::Ptr coeffs(new pcl::ModelCoefficients);  // 用于存平面系数ax+by+cz+d=0 的 a b c d 四个系数
     seg.segment(*inliers, *coeffs);
 
     if (inliers->indices.empty() ||
       inliers->indices.size() < min_ground)
-    {
+    {  // 如果内点数小于最小地面点数，则回退到高度分割
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
         "RANSAC ground failed (inliers=%zu); fallback to height split",
         inliers->indices.size());
-      splitByHeight(input, obstacles, ground);
-      return;
+        splitByHeight(input, obstacles, ground);
+        return;
+      }
+  
+      pcl::ExtractIndices<PointT> extract;
+      extract.setInputCloud(input);
+      extract.setIndices(inliers);
+      extract.setNegative(false);
+      extract.filter(*ground);
+      extract.setNegative(true);
+      extract.filter(*obstacles);
     }
-
-    pcl::ExtractIndices<PointT> extract;
-    extract.setInputCloud(input);
-    extract.setIndices(inliers);
-    extract.setNegative(false);
-    extract.filter(*ground);
-    extract.setNegative(true);
-    extract.filter(*obstacles);
-  }
-
+  
+  /**
+  大致流程：
+  障碍物点云
+  建立 KD-Tree
+  查找每个点附近的邻居
+  通过邻接关系组成聚类
+  过滤过小、过大的聚类
+  根据索引复制出每个聚类点云
+  */
   std::vector<CloudT::Ptr> euclideanCluster(const CloudT::Ptr & obstacles)
   {
     std::vector<CloudT::Ptr> out;
@@ -205,17 +229,17 @@ private:
       return out;
     }
 
-    pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
-    tree->setInputCloud(obstacles);
+    pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);  // 创建 KD-Tree； 欧式聚类需要不断回答： 距离当前点15厘米以内有哪些点？ 如果没有空间索引，每查询一个点，都遍历整片点云。 KD-Tree 会按照空间位置组织点，使邻域查询更快。
+    tree->setInputCloud(obstacles);  // 把点云交给 KD-Tree
 
-    std::vector<pcl::PointIndices> cluster_indices;
-    pcl::EuclideanClusterExtraction<PointT> ec;
-    ec.setClusterTolerance(get_parameter("cluster_tolerance_m").as_double());
-    ec.setMinClusterSize(get_parameter("cluster_min_points").as_int());
-    ec.setMaxClusterSize(get_parameter("cluster_max_points").as_int());
-    ec.setSearchMethod(tree);
-    ec.setInputCloud(obstacles);
-    ec.extract(cluster_indices);
+    std::vector<pcl::PointIndices> cluster_indices;  // 创建聚类索引数组； 用于保存每个聚类有哪些点
+    pcl::EuclideanClusterExtraction<PointT> ec;  // 创建欧式聚类器
+    ec.setClusterTolerance(get_parameter("cluster_tolerance_m").as_double());  // 设置邻接距离，这也是左墙-尽头墙-右墙连接的原因
+    ec.setMinClusterSize(get_parameter("cluster_min_points").as_int());  // 设置最小聚类点数
+    ec.setMaxClusterSize(get_parameter("cluster_max_points").as_int());  // 设最大聚类点数（目前是25000）
+    ec.setSearchMethod(tree);  // 设置搜索方法， 现在用的是KD-Tree
+    ec.setInputCloud(obstacles);  // 设置输入点云
+    ec.extract(cluster_indices);  // 正式运行聚类
 
     const int max_clusters = get_parameter("max_clusters").as_int();
     int count = 0;

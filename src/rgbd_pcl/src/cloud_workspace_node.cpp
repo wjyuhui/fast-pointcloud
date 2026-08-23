@@ -77,7 +77,8 @@ private:
         info_topic_.c_str());
       return;
     }
-
+    
+    // 在这里稀疏反投影depthToCloudSparse
     CloudT::Ptr cloud_cam(new CloudT);
     if (!depthToCloudSparse(*msg, *cloud_cam) || cloud_cam->empty()) {
       return;
@@ -92,7 +93,7 @@ private:
       return;
     }
 
-    CloudT::Ptr cloud_cut(new CloudT);
+    CloudT::Ptr cloud_cut(new CloudT);  // 下面整个步骤是做点云切割，去掉无效点
     {
       pcl::PassThrough<PointT> pass;
       pass.setInputCloud(cloud_base);
@@ -112,7 +113,7 @@ private:
       cloud_cut.swap(tmp);
     }
 
-    CloudT::Ptr cloud_voxel(new CloudT);
+    CloudT::Ptr cloud_voxel(new CloudT);  // 下面整个步骤是做点云体素滤波，去掉密集点（降采样）
     {
       pcl::VoxelGrid<PointT> vg;
       vg.setInputCloud(cloud_cut);
@@ -136,6 +137,8 @@ private:
 
   bool depthToCloudSparse(const sensor_msgs::msg::Image & depth, CloudT & cloud)
   {
+    // 在这里稀疏反投影depthToCloudSparse
+    // depth_stride 设置多少个像素取一个点
     const int stride = std::max(1, static_cast<int>(get_parameter("depth_stride").as_int()));
     const float zmin = static_cast<float>(get_parameter("min_depth_m").as_double());
     const float zmax = static_cast<float>(get_parameter("max_depth_m").as_double());
@@ -157,6 +160,7 @@ private:
     cloud.clear();
     cloud.reserve(static_cast<size_t>((width / stride) * (height / stride)));
 
+    // 在这里稀疏反投影depthToCloudSparse  核心函数
     auto push_z = [&](int u, int v, float z) {
       if (!std::isfinite(z) || z < zmin || z > zmax) {
         return;
@@ -172,6 +176,8 @@ private:
       if (depth.step < static_cast<size_t>(width) * sizeof(uint16_t)) {
         return false;
       }
+
+      // 遍历一次深度图像
       for (int v = 0; v < height; v += stride) {
         const auto * row = reinterpret_cast<const uint16_t *>(
           depth.data.data() + static_cast<size_t>(v) * depth.step);
@@ -183,6 +189,8 @@ private:
       if (depth.step < static_cast<size_t>(width) * sizeof(float)) {
         return false;
       }
+
+      // 遍历一次深度图像
       for (int v = 0; v < height; v += stride) {
         const auto * row = reinterpret_cast<const float *>(
           depth.data.data() + static_cast<size_t>(v) * depth.step);
@@ -206,7 +214,7 @@ private:
     const CloudT & cloud_in, const std::string & frame_in,
     const rclcpp::Time & stamp, CloudT & cloud_out)
   {
-    cloud_out.clear();
+    cloud_out.clear();  // 为什么需要先晴空呢？本身不就是刚刚创建的吗？
     if (frame_in == target_frame_) {
       cloud_out = cloud_in;
       return true;

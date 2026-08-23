@@ -30,17 +30,17 @@ public:
     declare_parameter<int>("occupied_count", 2);
     declare_parameter<bool>("publish_markers", true);
 
-    frame_id_ = get_parameter("frame_id").as_string();
-    x_min_ = get_parameter("x_min_m").as_double();
-    x_max_ = get_parameter("x_max_m").as_double();
+    frame_id_ = get_parameter("frame_id").as_string();  // OccupancyGrid 的坐标系
+    x_min_ = get_parameter("x_min_m").as_double();    
+    x_max_ = get_parameter("x_max_m").as_double();  // x_min_m / x_max_m 前方距离 0～5m
     y_min_ = get_parameter("y_min_m").as_double();
-    y_max_ = get_parameter("y_max_m").as_double();
-    res_ = get_parameter("resolution_m").as_double();
-    z_min_ = get_parameter("z_min_m").as_double();
-    z_max_ = get_parameter("z_max_m").as_double();
-    occ_count_ = get_parameter("occupied_count").as_int();
+    y_max_ = get_parameter("y_max_m").as_double();  //  同x 
+    res_ = get_parameter("resolution_m").as_double();  // 地图分辨率 一格边长 5cm
+    z_min_ = get_parameter("z_min_m").as_double();  // 
+    z_max_ = get_parameter("z_max_m").as_double();  // 同x
+    occ_count_ = get_parameter("occupied_count").as_int();  // 障碍物阈值 超过这个数就标占用
 
-    rows_ = static_cast<int>(std::ceil((x_max_ - x_min_) / res_));
+    rows_ = static_cast<int>(std::ceil((x_max_ - x_min_) / res_));  // 计算行数和列数 格子数
     cols_ = static_cast<int>(std::ceil((y_max_ - y_min_) / res_));
 
     sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -56,28 +56,39 @@ public:
   }
 
 private:
+
+  /** 
+  把一帧障碍点云压成一张鸟瞰占用图：3D 点 → 数每个格子里有几个点 → 超过阈值就标占用 → 发出去。
+  大致流程：
+    PointCloud2
+    → 遍历每个点的 x/y/z
+    → 丢掉无效 / 盒子外的点
+    → 投到格子 (ix, iy)，counts++
+    → 按 OccupancyGrid 规则写入 data（0 或 100）
+    → 发布；可选再画 Marker
+  */ 
   void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   {
-    std::vector<int> counts(static_cast<size_t>(rows_ * cols_), 0);
+    std::vector<int> counts(static_cast<size_t>(rows_ * cols_), 0);  // 创建一个大小为 rows_ * cols_ 的数组，用于存储每个格子里的点数
 
     sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
     sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
-    sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
+    sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");  // 这是用来直接遍历ROS PointCloud2的z值的   x， y 同理
     for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
       const float x = *iter_x;
       const float y = *iter_y;
       const float z = *iter_z;
-      if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {   // isfinite 判断一个浮点数是不是普通有限值
         continue;
       }
       if (x < x_min_ || x >= x_max_ || y < y_min_ || y >= y_max_ ||
-        z < z_min_ || z > z_max_)
+        z < z_min_ || z > z_max_)  // 判断一个浮点数是不是在指定范围内
       {
         continue;
       }
-      const int ix = static_cast<int>((x - x_min_) / res_);
+      const int ix = static_cast<int>((x - x_min_) / res_);  // 计算一个点在地图上的哪个格子
       const int iy = static_cast<int>((y - y_min_) / res_);
-      if (ix < 0 || ix >= rows_ || iy < 0 || iy >= cols_) {
+      if (ix < 0 || ix >= rows_ || iy < 0 || iy >= cols_) {  // 格子外的不要了
         continue;
       }
       // OccupancyGrid: row-major, index = iy + ix * cols? 

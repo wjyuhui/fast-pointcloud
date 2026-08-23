@@ -46,8 +46,8 @@ bev_node:
     resolution_m: 0.05
     z_min_m: 0.05
     z_max_m: 1.8
-    occupied_count: 2
-    publish_markers: true
+    occupied_count: 5
+    publish_markers: false
 
 yolo_3d_node:
   ros__parameters:

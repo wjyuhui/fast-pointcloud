@@ -157,3 +157,15 @@
         PassThrough	                   ★	    ★★★★★	  ★★★★★	    太简单，不适合当核心亮点
         Cluster bbox/center	           ★     	★★★        ★★★★     可以顺手优化
         PointCloud2 转换	          ★★         不太合适 	不太合适  更偏数据流优化
+
+
+26.08.22:
+    1.  f2_ros::Buffer tf_buffer_;  // 创建用于缓存tf数据的空间
+    
+        tf2_ros::TransformListener tf_listener_;  // 用于监听tf变化的变量，有变化会更新内容放进tf_buffer_
+
+        geometry_msgs::msg::TransformStamped tf;  // 创建变量用于记录从一个坐标到另一个坐标的刚体变化
+
+        tf = tf_buffer_.lookupTransform(目标坐标系, 原坐标系, 当前数据的时间戳, 超时机制);
+
+        转成 Eigen 矩阵，逐点相乘

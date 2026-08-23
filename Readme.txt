@@ -123,7 +123,7 @@ ros2 bag record -o cam_$(date +%Y%m%d_%H%M%S) \
   /camera/depth/camera_info \
   /tf_static
 
-
+启动包： ros2 bag play ./ --start-offset 0.5 -l
 
 相机节点分析：
 最原始的信息：

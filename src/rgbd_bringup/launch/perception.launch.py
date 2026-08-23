@@ -30,7 +30,7 @@ def launch_setup(context, *args, **kwargs):
             executable='static_transform_publisher',
             name='base_to_camera_link',
             arguments=[
-                '--x', '0', '--y', '0', '--z', '0.8',
+                '--x', '0', '--y', '0', '--z', '1.5',
                 '--roll', '0', '--pitch', '0', '--yaw', '0',
                 '--frame-id', 'base_link',
                 '--child-frame-id', 'camera_link',
