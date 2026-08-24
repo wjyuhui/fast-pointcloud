@@ -2,10 +2,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <limits>
-#include <memory>
+#include <fstream>
+#include <mutex>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include <cv_bridge/cv_bridge.h>
@@ -13,11 +12,11 @@
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/synchronizer.h>
-#include <onnxruntime_cxx_api.h>
 #include <opencv2/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rgbd_perception_msgs/msg/detection3_d.hpp>
 #include <rgbd_perception_msgs/msg/detection3_d_array.hpp>
+#include <rknn_api.h>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -28,6 +27,8 @@
 
 namespace
 {
+
+constexpr int kPersonClassId = 0;
 
 const char * kCocoNames[80] = {
   "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
@@ -93,15 +94,13 @@ public:
   Yolo3dNode()
   : Node("yolo_3d_node"),
     tf_buffer_(this->get_clock()),
-    tf_listener_(tf_buffer_),
-    env_(ORT_LOGGING_LEVEL_WARNING, "yolo_3d"),
-    memory_info_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault))
+    tf_listener_(tf_buffer_)
   {
     declare_parameter<std::string>("model_path", "");
     declare_parameter<double>("conf_thresh", 0.35);
     declare_parameter<double>("iou_thresh", 0.45);
     declare_parameter<int>("imgsz", 640);
-    declare_parameter<std::vector<int64_t>>("class_whitelist", {0, 56, 57, 59, 60, 62, 63});
+    declare_parameter<std::vector<int64_t>>("class_whitelist", {kPersonClassId});
     declare_parameter<double>("depth_percentile", 50.0);
     declare_parameter<double>("trim_low", 0.1);
     declare_parameter<double>("trim_high", 0.9);
@@ -120,20 +119,18 @@ public:
     iou_thresh_ = static_cast<float>(get_parameter("iou_thresh").as_double());
     imgsz_ = get_parameter("imgsz").as_int();
 
-    for (auto id : get_parameter("class_whitelist").as_integer_array()) {
-      whitelist_.insert(static_cast<int>(id));
-    }
+    (void)get_parameter("class_whitelist");
 
     const std::string model_path = get_parameter("model_path").as_string();
     enable_detection_ = get_parameter("enable_detection").as_bool();
     if (enable_detection_) {
       if (model_path.empty() || !loadModel(model_path)) {
         RCLCPP_WARN(get_logger(),
-          "YOLO model not loaded (path='%s'). Node will skip detection until model is available.",
+          "YOLO RKNN model not loaded (path='%s'). Node will skip detection until model is available.",
           model_path.c_str());
         enable_detection_ = false;
       } else {
-        RCLCPP_INFO(get_logger(), "Loaded YOLO ONNX via ORT: %s", model_path.c_str());
+        RCLCPP_INFO(get_logger(), "Loaded YOLO RKNN: %s (imgsz=%d)", model_path.c_str(), imgsz_);
       }
     }
 
@@ -159,35 +156,88 @@ public:
       "/perception/markers/detections", 10);
   }
 
+  ~Yolo3dNode() override
+  {
+    if (ctx_ != 0) {
+      rknn_destroy(ctx_);
+      ctx_ = 0;
+    }
+  }
+
 private:
   using SyncPolicy = message_filters::sync_policies::ApproximateTime<
     sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
 
   bool loadModel(const std::string & path)
   {
-    try {
-      Ort::SessionOptions opts;
-      opts.SetIntraOpNumThreads(2);
-      opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-      session_ = std::make_unique<Ort::Session>(env_, path.c_str(), opts);
-
-      Ort::AllocatorWithDefaultOptions allocator;
-      {
-        auto in = session_->GetInputNameAllocated(0, allocator);
-        auto out = session_->GetOutputNameAllocated(0, allocator);
-        input_name_ = in.get();
-        output_name_ = out.get();
-      }
-      auto in_info = session_->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
-      // expect [1,3,H,W]
-      if (in_info.size() == 4 && in_info[2] > 0) {
-        imgsz_ = static_cast<int>(in_info[2]);
-      }
-      return true;
-    } catch (const Ort::Exception & e) {
-      RCLCPP_ERROR(get_logger(), "ORT load failed: %s", e.what());
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+      RCLCPP_ERROR(get_logger(), "Cannot open RKNN model: %s", path.c_str());
       return false;
     }
+    ifs.seekg(0, std::ios::end);
+    const auto sz = ifs.tellg();
+    ifs.seekg(0, std::ios::beg);
+    std::vector<char> model(static_cast<size_t>(sz));
+    ifs.read(model.data(), sz);
+    if (!ifs) {
+      RCLCPP_ERROR(get_logger(), "Failed to read RKNN model: %s", path.c_str());
+      return false;
+    }
+
+    int ret = rknn_init(&ctx_, model.data(), static_cast<uint32_t>(model.size()), 0, nullptr);
+    if (ret != RKNN_SUCC) {
+      RCLCPP_ERROR(get_logger(), "rknn_init failed: %d", ret);
+      ctx_ = 0;
+      return false;
+    }
+
+    rknn_set_core_mask(ctx_, RKNN_NPU_CORE_0_1_2);
+
+    rknn_sdk_version ver{};
+    if (rknn_query(ctx_, RKNN_QUERY_SDK_VERSION, &ver, sizeof(ver)) == RKNN_SUCC) {
+      RCLCPP_INFO(get_logger(), "RKNN api=%s driver=%s", ver.api_version, ver.drv_version);
+    }
+
+    rknn_input_output_num io{};
+    ret = rknn_query(ctx_, RKNN_QUERY_IN_OUT_NUM, &io, sizeof(io));
+    if (ret != RKNN_SUCC || io.n_input < 1 || io.n_output < 1) {
+      RCLCPP_ERROR(get_logger(), "RKNN I/O query failed (in=%u out=%u ret=%d)",
+        io.n_input, io.n_output, ret);
+      return false;
+    }
+
+    rknn_tensor_attr in_attr{};
+    in_attr.index = 0;
+    ret = rknn_query(ctx_, RKNN_QUERY_INPUT_ATTR, &in_attr, sizeof(in_attr));
+    if (ret != RKNN_SUCC) {
+      RCLCPP_ERROR(get_logger(), "RKNN input attr query failed: %d", ret);
+      return false;
+    }
+
+    rknn_tensor_attr out_attr{};
+    out_attr.index = 0;
+    ret = rknn_query(ctx_, RKNN_QUERY_OUTPUT_ATTR, &out_attr, sizeof(out_attr));
+    if (ret != RKNN_SUCC) {
+      RCLCPP_ERROR(get_logger(), "RKNN output attr query failed: %d", ret);
+      return false;
+    }
+
+    if (in_attr.fmt == RKNN_TENSOR_NHWC && in_attr.n_dims >= 3) {
+      imgsz_ = static_cast<int>(in_attr.dims[1]);
+    } else if (in_attr.n_dims >= 4) {
+      imgsz_ = static_cast<int>(in_attr.dims[2]);
+    }
+
+    RCLCPP_INFO(get_logger(),
+      "RKNN input %s %s dims=[%u,%u,%u,%u] output %s elems=%u",
+      in_attr.name, get_format_string(in_attr.fmt),
+      in_attr.n_dims > 0 ? in_attr.dims[0] : 0,
+      in_attr.n_dims > 1 ? in_attr.dims[1] : 0,
+      in_attr.n_dims > 2 ? in_attr.dims[2] : 0,
+      in_attr.n_dims > 3 ? in_attr.dims[3] : 0,
+      out_attr.name, out_attr.n_elems);
+    return true;
   }
 
   void syncCallback(
@@ -198,7 +248,7 @@ private:
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Waiting for camera_info...");
       return;
     }
-    if (!enable_detection_ || !session_) {
+    if (!enable_detection_ || ctx_ == 0) {
       return;
     }
 
@@ -243,7 +293,7 @@ private:
 
   std::vector<Det2D> inferYolo(const cv::Mat & bgr)
   {
-    std::vector<Det2D> out;
+    std::vector<Det2D> empty;
     const int img_w = bgr.cols;
     const int img_h = bgr.rows;
 
@@ -259,77 +309,74 @@ private:
     cv::Mat input(imgsz_, imgsz_, CV_8UC3, cv::Scalar(114, 114, 114));
     resized.copyTo(input(cv::Rect(pad_left, pad_top, new_w, new_h)));
     cv::cvtColor(input, input, cv::COLOR_BGR2RGB);
-    input.convertTo(input, CV_32FC3, 1.0 / 255.0);
 
-    // HWC -> CHW
-    std::vector<float> blob(static_cast<size_t>(3 * imgsz_ * imgsz_));
-    std::vector<cv::Mat> channels(3);
-    cv::split(input, channels);
-    for (int c = 0; c < 3; ++c) {
-      std::memcpy(
-        blob.data() + static_cast<size_t>(c * imgsz_ * imgsz_),
-        channels[c].data,
-        static_cast<size_t>(imgsz_ * imgsz_) * sizeof(float));
+    rknn_input inputs[1];
+    std::memset(inputs, 0, sizeof(inputs));
+    inputs[0].index = 0;
+    inputs[0].type = RKNN_TENSOR_UINT8;
+    inputs[0].fmt = RKNN_TENSOR_NHWC;
+    inputs[0].size = static_cast<uint32_t>(imgsz_ * imgsz_ * 3);
+    inputs[0].buf = input.data;
+    inputs[0].pass_through = 0;
+
+    std::lock_guard<std::mutex> lock(infer_mu_);
+    int ret = rknn_inputs_set(ctx_, 1, inputs);
+    if (ret != RKNN_SUCC) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "rknn_inputs_set failed: %d", ret);
+      return empty;
+    }
+    ret = rknn_run(ctx_, nullptr);
+    if (ret != RKNN_SUCC) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "rknn_run failed: %d", ret);
+      return empty;
     }
 
-    std::array<int64_t, 4> input_shape{1, 3, imgsz_, imgsz_};
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-      memory_info_, blob.data(), blob.size(), input_shape.data(), input_shape.size());
+    rknn_output outputs[1];
+    std::memset(outputs, 0, sizeof(outputs));
+    outputs[0].want_float = 1;
+    outputs[0].index = 0;
+    ret = rknn_outputs_get(ctx_, 1, outputs, nullptr);
+    if (ret != RKNN_SUCC || outputs[0].buf == nullptr) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "rknn_outputs_get failed: %d", ret);
+      return empty;
+    }
 
-    const char * input_names[] = {input_name_.c_str()};
-    const char * output_names[] = {output_name_.c_str()};
-    auto outputs = session_->Run(
-      Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1);
-
-    float * data = outputs[0].GetTensorMutableData<float>();
-    auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
-    // YOLOv8: [1, 84, N] typically
+    auto * data = static_cast<float *>(outputs[0].buf);
+    const uint32_t n_elems = outputs[0].size / static_cast<uint32_t>(sizeof(float));
+    // YOLOv8: [1, 84, 8400] = 4 box attrs + 80 class scores
     int64_t attrs = 84;
     int64_t num = 8400;
-    bool transposed = false;  // false means [1,84,N]
-    if (shape.size() == 3) {
-      if (shape[1] < shape[2]) {
-        attrs = shape[1];
-        num = shape[2];
-        transposed = false;
-      } else {
-        attrs = shape[2];
-        num = shape[1];
-        transposed = true;
+    bool transposed = false;
+    if (n_elems == 84 * 8400 || n_elems == 1 * 84 * 8400) {
+      attrs = 84;
+      num = 8400;
+      transposed = false;
+    } else if (n_elems > 84) {
+      if (n_elems % 84 == 0) {
+        num = static_cast<int64_t>(n_elems / 84);
+        attrs = 84;
       }
     }
 
     std::vector<Det2D> cand;
-    const int num_classes = static_cast<int>(attrs - 4);
     for (int64_t i = 0; i < num; ++i) {
-      float cx, cy, w, h;
-      std::vector<float> scores(static_cast<size_t>(num_classes));
+      float cx, cy, w, h, score;
       if (!transposed) {
         cx = data[0 * num + i];
         cy = data[1 * num + i];
         w = data[2 * num + i];
         h = data[3 * num + i];
-        for (int c = 0; c < num_classes; ++c) {
-          scores[static_cast<size_t>(c)] = data[(4 + c) * num + i];
-        }
+        score = data[(4 + kPersonClassId) * num + i];
       } else {
         const float * row = data + i * attrs;
         cx = row[0]; cy = row[1]; w = row[2]; h = row[3];
-        for (int c = 0; c < num_classes; ++c) {
-          scores[static_cast<size_t>(c)] = row[4 + c];
-        }
+        score = row[4 + kPersonClassId];
       }
-      const auto max_it = std::max_element(scores.begin(), scores.end());
-      const float score = *max_it;
       if (score < conf_thresh_) {
         continue;
       }
-      const int class_id = static_cast<int>(std::distance(scores.begin(), max_it));
-      if (!whitelist_.empty() && whitelist_.count(class_id) == 0) {
-        continue;
-      }
       Det2D d;
-      d.class_id = class_id;
+      d.class_id = kPersonClassId;
       d.score = score;
       d.x1 = (cx - 0.5f * w - pad_left) / scale;
       d.y1 = (cy - 0.5f * h - pad_top) / scale;
@@ -343,6 +390,8 @@ private:
         cand.push_back(d);
       }
     }
+
+    rknn_outputs_release(ctx_, 1, outputs);
     return nms(cand, iou_thresh_);
   }
 
@@ -491,11 +540,8 @@ private:
   rclcpp::Publisher<rgbd_perception_msgs::msg::Detection3DArray>::SharedPtr det_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
 
-  Ort::Env env_;
-  Ort::MemoryInfo memory_info_;
-  std::unique_ptr<Ort::Session> session_;
-  std::string input_name_;
-  std::string output_name_;
+  rknn_context ctx_{0};
+  std::mutex infer_mu_;
 
   sensor_msgs::msg::CameraInfo camera_info_;
   bool have_info_{false};
@@ -504,7 +550,6 @@ private:
   float conf_thresh_{0.35f};
   float iou_thresh_{0.45f};
   int imgsz_{640};
-  std::unordered_set<int> whitelist_;
 };
 
 int main(int argc, char ** argv)

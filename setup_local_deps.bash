@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Only ONNX Runtime for yolo_3d_node (PCL/g++ come from apt now).
+# RKNN runtime for yolo_3d_node (PCL/g++ come from apt).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-ORT_DIR="${ROOT}/.deps/onnxruntime-linux-x64-1.17.1"
-if [[ -d "${ORT_DIR}" ]]; then
-  export ONNXRUNTIME_ROOT="${ORT_DIR}"
-  export LD_LIBRARY_PATH="${ORT_DIR}/lib:${LD_LIBRARY_PATH}"
+RKNN_DIR="${ROOT}/.deps/rknpu2"
+if [[ -f "${RKNN_DIR}/lib/librknnrt.so" ]]; then
+  export RKNN_ROOT="${RKNN_DIR}"
+  export LD_LIBRARY_PATH="${RKNN_DIR}/lib:${LD_LIBRARY_PATH:-}"
+elif [[ -f /usr/lib/librknnrt.so ]]; then
+  export LD_LIBRARY_PATH="/usr/lib:${LD_LIBRARY_PATH:-}"
 else
-  echo "WARN: ONNX Runtime not found at ${ORT_DIR}" >&2
+  echo "WARN: librknnrt.so not found under ${RKNN_DIR}/lib or /usr/lib" >&2
 fi

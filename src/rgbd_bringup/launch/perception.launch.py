@@ -16,7 +16,7 @@ def launch_setup(context, *args, **kwargs):
 
     model_path = LaunchConfiguration('model_path').perform(context)
     if not model_path:
-        model_path = os.path.join(detection_share, 'models', 'yolov8n.onnx')
+        model_path = os.path.join(detection_share, 'models', 'yolov8n_rk3588_fp16.rknn')
 
     use_orbbec = LaunchConfiguration('use_orbbec').perform(context) == 'true'
     enable_yolo = LaunchConfiguration('enable_yolo').perform(context) == 'true'
@@ -93,16 +93,24 @@ def launch_setup(context, *args, **kwargs):
                     'gemini_330_series.launch.py',
                 ])
             ]),
-            launch_arguments={
-                'depth_registration': 'true',
-                'align_mode': 'SW',
-                # Driver does not publish dense PointCloud2; workspace node builds it from depth.
-                'enable_point_cloud': 'false',
-                'enable_colored_point_cloud': 'false',
-                'publish_tf': 'true',
-                'color_width': '1280',
-                'color_height': '720',
-            }.items(),
+           launch_arguments={
+          'depth_registration': 'true',
+          'align_mode': 'SW',
+          'align_target_stream': 'COLOR',
+
+          'depth_width': '1280',
+          'depth_height': '720',
+          'depth_fps': '30',
+
+          'color_width': '1280',
+          'color_height': '720',
+          'color_fps': '30',
+
+          'color_qos': 'SENSOR_DATA',
+          'depth_qos': 'SENSOR_DATA',
+          'color_camera_info_qos': 'SENSOR_DATA',
+          'depth_camera_info_qos': 'SENSOR_DATA',
+          }.items(),
         )
         actions.insert(0, orbbec_launch)
 

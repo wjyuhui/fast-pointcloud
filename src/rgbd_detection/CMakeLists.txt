@@ -20,32 +20,34 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(rgbd_perception_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 
-# ONNX Runtime (local unpack under workspace .deps preferred)
-if(NOT ONNXRUNTIME_ROOT)
-  if(DEFINED ENV{ONNXRUNTIME_ROOT})
-    set(ONNXRUNTIME_ROOT $ENV{ONNXRUNTIME_ROOT})
-  else()
-    file(GLOB _ort_candidates
-      "${CMAKE_SOURCE_DIR}/../../.deps/onnxruntime-linux-x64-*"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../../../.deps/onnxruntime-linux-x64-*")
-    if(_ort_candidates)
-      list(GET _ort_candidates 0 ONNXRUNTIME_ROOT)
-    endif()
-  endif()
+set(_rknn_hints)
+if(RKNN_ROOT)
+  list(APPEND _rknn_hints "${RKNN_ROOT}/lib")
 endif()
+if(DEFINED ENV{RKNN_ROOT})
+  list(APPEND _rknn_hints "$ENV{RKNN_ROOT}/lib")
+endif()
+list(APPEND _rknn_hints
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../.deps/rknpu2/lib"
+  "${CMAKE_SOURCE_DIR}/../../.deps/rknpu2/lib"
+  /usr/lib
+  /usr/lib64
+  /usr/lib/aarch64-linux-gnu
+)
 
-if(NOT ONNXRUNTIME_ROOT OR NOT EXISTS "${ONNXRUNTIME_ROOT}/include/onnxruntime_cxx_api.h")
+find_library(RKNN_RT_LIB NAMES rknnrt HINTS ${_rknn_hints})
+if(NOT RKNN_RT_LIB)
   message(FATAL_ERROR
-    "ONNX Runtime not found. Set ONNXRUNTIME_ROOT or unpack "
-    "onnxruntime-linux-x64-* under ros2_ws/.deps/")
+    "librknnrt.so not found. Install the RKNN runtime (rknpu2) or place "
+    "librknnrt.so under .deps/rknpu2/lib and set RKNN_ROOT.")
 endif()
-
-message(STATUS "Using ONNX Runtime at ${ONNXRUNTIME_ROOT}")
+get_filename_component(RKNN_RT_DIR "${RKNN_RT_LIB}" DIRECTORY)
+message(STATUS "Using RKNN runtime: ${RKNN_RT_LIB}")
 
 add_executable(yolo_3d_node src/yolo_3d_node.cpp)
 target_include_directories(yolo_3d_node PUBLIC
   ${OpenCV_INCLUDE_DIRS}
-  ${ONNXRUNTIME_ROOT}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rknn/include
 )
 ament_target_dependencies(yolo_3d_node
   rclcpp sensor_msgs visualization_msgs geometry_msgs
@@ -54,11 +56,11 @@ ament_target_dependencies(yolo_3d_node
 )
 target_link_libraries(yolo_3d_node
   ${OpenCV_LIBS}
-  ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so
+  ${RKNN_RT_LIB}
 )
 set_target_properties(yolo_3d_node PROPERTIES
-  BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib"
-  INSTALL_RPATH "${ONNXRUNTIME_ROOT}/lib"
+  BUILD_RPATH "${RKNN_RT_DIR}"
+  INSTALL_RPATH "${RKNN_RT_DIR}"
 )
 
 install(TARGETS yolo_3d_node DESTINATION lib/${PROJECT_NAME})

@@ -31,7 +31,7 @@ orbbec_camera（官方）
   rgbd_perception_msgs  自定义消息
   rgbd_pcl              cloud_workspace_node + pcl_obstacle_node
   rgbd_bev              bev_node
-  rgbd_detection        yolo_3d_node (ONNX Runtime + OpenCV 预处理)
+  rgbd_detection        yolo_3d_node (RKNN YOLOv8 person + OpenCV 预处理)
   rgbd_bringup          launch / config
   OrbbecSDK_ROS2        官方相机驱动
 
@@ -80,14 +80,13 @@ bev_node：
 
 # 依赖：系统 apt 装 libpcl-dev / g++ 最省事；当前也可用工作空间本地解压依赖：
 source /opt/ros/humble/setup.bash
-source /home/yuhui/ros2_ws/setup_local_deps.bash   # PCL/Boost/g++/ONNXRuntime
+source /home/yuhui/ros2_ws/setup_local_deps.bash   # RKNN runtime (librknnrt)
 
 cd /home/yuhui/ros2_ws
-colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_ROOT=$ONNXRUNTIME_ROOT
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 
-# YOLO ONNX（已放 models/yolov8n.onnx；需重导出时）：
-#   bash scripts/export_yolo_onnx.sh
+# YOLO RKNN：models/yolov8n_rk3588_fp16.rknn（仅检测 person）
 
 # 全栈（含 Orbbec）：
 ros2 launch rgbd_bringup perception.launch.py

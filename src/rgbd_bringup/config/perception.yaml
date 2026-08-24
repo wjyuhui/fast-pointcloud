@@ -57,7 +57,7 @@ yolo_3d_node:
     conf_thresh: 0.35
     iou_thresh: 0.45
     imgsz: 640
-    class_whitelist: [0, 56, 57, 59, 60, 62, 63]
+    class_whitelist: [0]  # person only
     depth_percentile: 50.0
     trim_low: 0.1
     trim_high: 0.9

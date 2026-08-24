@@ -3,7 +3,7 @@
 <package format="3">
   <name>rgbd_detection</name>
   <version>0.1.0</version>
-  <description>YOLO (OpenCV DNN ONNX) + ROI depth lift to 3D detections.</description>
+  <description>YOLOv8 person detection on RKNN + ROI depth lift to 3D detections.</description>
   <maintainer email="yuhui@todo.todo">yuhui</maintainer>
   <license>Apache-2.0</license>
 
