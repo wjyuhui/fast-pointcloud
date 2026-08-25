@@ -110,7 +110,7 @@ private:
   {
     RCLCPP_INFO(
       get_logger(),
-      "PERF V0 samples=%zu core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms",
+      "PERF V1 samples=%zu core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms",
       core_samples_.size(),
       calculateP95(core_samples_),
       calculateP95(voxel_samples_),
@@ -239,17 +239,20 @@ private:
       return false;
     }
 
+    if (!ensureRayCache(width, height, stride, fx, fy, cx, cy)) {
+      return false;
+    }
+
     cloud.clear();
     cloud.reserve(static_cast<size_t>((width / stride) * (height / stride)));
 
-    // 在这里稀疏反投影depthToCloudSparse  核心函数
-    auto push_z = [&](int u, int v, float z) {
+    auto push_z = [&](int ui, int vi, float z) {
       if (!std::isfinite(z) || z < zmin || z > zmax) {
         return;
       }
       PointT p;
-      p.x = static_cast<float>((static_cast<double>(u) - cx) * static_cast<double>(z) / fx);
-      p.y = static_cast<float>((static_cast<double>(v) - cy) * static_cast<double>(z) / fy);
+      p.x = ray_x_[static_cast<size_t>(ui)] * z;
+      p.y = ray_y_[static_cast<size_t>(vi)] * z;
       p.z = z;
       cloud.push_back(p);
     };
@@ -259,12 +262,11 @@ private:
         return false;
       }
 
-      // 遍历一次深度图像
-      for (int v = 0; v < height; v += stride) {
+      for (int vi = 0, v = 0; v < height; v += stride, ++vi) {
         const auto * row = reinterpret_cast<const uint16_t *>(
           depth.data.data() + static_cast<size_t>(v) * depth.step);
-        for (int u = 0; u < width; u += stride) {
-          push_z(u, v, static_cast<float>(row[u]) * 0.001f);
+        for (int ui = 0, u = 0; u < width; u += stride, ++ui) {
+          push_z(ui, vi, static_cast<float>(row[u]) * 0.001f);
         }
       }
     } else if (depth.encoding == "32FC1") {
@@ -272,12 +274,11 @@ private:
         return false;
       }
 
-      // 遍历一次深度图像
-      for (int v = 0; v < height; v += stride) {
+      for (int vi = 0, v = 0; v < height; v += stride, ++vi) {
         const auto * row = reinterpret_cast<const float *>(
           depth.data.data() + static_cast<size_t>(v) * depth.step);
-        for (int u = 0; u < width; u += stride) {
-          push_z(u, v, row[u]);
+        for (int ui = 0, u = 0; u < width; u += stride, ++ui) {
+          push_z(ui, vi, row[u]);
         }
       }
     } else {
@@ -290,6 +291,50 @@ private:
     cloud.height = 1;
     cloud.is_dense = true;
     return !cloud.empty();
+  }
+
+  bool ensureRayCache(
+    int width, int height, int stride,
+    double fx, double fy, double cx, double cy)
+  {
+    if (camera_info_.width > 0 && camera_info_.height > 0 &&
+        (static_cast<int>(camera_info_.width) != width ||
+         static_cast<int>(camera_info_.height) != height))
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "depth size %dx%d != camera_info %ux%u",
+        width, height, camera_info_.width, camera_info_.height);
+      return false;
+    }
+
+    if (cached_width_ == width && cached_height_ == height && cached_stride_ == stride &&
+        cached_fx_ == fx && cached_fy_ == fy && cached_cx_ == cx && cached_cy_ == cy)
+    {
+      return true;
+    }
+
+    const int nx = (width + stride - 1) / stride;
+    const int ny = (height + stride - 1) / stride;
+    ray_x_.resize(static_cast<size_t>(nx));
+    ray_y_.resize(static_cast<size_t>(ny));
+    for (int ui = 0, u = 0; u < width; u += stride, ++ui) {
+      ray_x_[static_cast<size_t>(ui)] =
+        static_cast<float>((static_cast<double>(u) - cx) / fx);
+    }
+    for (int vi = 0, v = 0; v < height; v += stride, ++vi) {
+      ray_y_[static_cast<size_t>(vi)] =
+        static_cast<float>((static_cast<double>(v) - cy) / fy);
+    }
+
+    cached_width_ = width;
+    cached_height_ = height;
+    cached_stride_ = stride;
+    cached_fx_ = fx;
+    cached_fy_ = fy;
+    cached_cx_ = cx;
+    cached_cy_ = cy;
+    return true;
   }
 
   bool transformCloud(
@@ -345,6 +390,15 @@ private:
   std::vector<double> voxel_samples_;
   std::vector<double> callback_samples_;
   bool have_info_{false};
+  std::vector<float> ray_x_;
+  std::vector<float> ray_y_;
+  int cached_width_{0};
+  int cached_height_{0};
+  int cached_stride_{0};
+  double cached_fx_{0.0};
+  double cached_fy_{0.0};
+  double cached_cx_{0.0};
+  double cached_cy_{0.0};
   sensor_msgs::msg::CameraInfo camera_info_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;

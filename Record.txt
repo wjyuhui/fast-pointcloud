@@ -245,4 +245,4 @@
         callback_p95：从回调开始到发布调用结束的整体耗时。  
 
         v0: PERF V0 samples=1000 core_p95=9.385 ms voxel_p95=5.695 ms callback_p95=15.200 ms
-        v1: 
+        v1: PERF V1 samples=1000 core_p95=8.877 ms voxel_p95=5.515 ms callback_p95=14.286 ms
