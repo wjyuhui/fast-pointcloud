@@ -7,7 +7,6 @@
 #include <vector>
 
 #include <Eigen/Geometry>
-#include <pcl/filters/passthrough.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -110,7 +109,7 @@ private:
   {
     RCLCPP_INFO(
       get_logger(),
-      "PERF V1 samples=%zu core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms",
+      "PERF V2 samples=%zu core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms",
       core_samples_.size(),
       calculateP95(core_samples_),
       calculateP95(voxel_samples_),
@@ -148,55 +147,30 @@ private:
       return;
     }
 
-    const auto core_begin = std::chrono::steady_clock::now();
-
-    CloudT::Ptr cloud_cam(new CloudT);
-    if (!depthToCloudSparse(*msg, *cloud_cam) || cloud_cam->empty()) {
-      return;
-    }
-
     const std::string optical_frame = camera_info_.header.frame_id.empty()
       ? msg->header.frame_id
       : camera_info_.header.frame_id;
 
+    Eigen::Affine3d transform = Eigen::Affine3d::Identity();
     double tf_lookup_ms = 0.0;
-    CloudT::Ptr cloud_base(new CloudT);
-    if (!transformCloud(
-          *cloud_cam, optical_frame, msg->header.stamp, *cloud_base, tf_lookup_ms))
-    {
+    if (!lookupTransformMatrix(optical_frame, msg->header.stamp, transform, tf_lookup_ms)) {
       return;
     }
 
-    CloudT::Ptr cloud_cut(new CloudT);  // 下面整个步骤是做点云切割，去掉无效点
-    {
-      pcl::PassThrough<PointT> pass;
-      pass.setInputCloud(cloud_base);
-      pass.setFilterFieldName("x");
-      pass.setFilterLimits(
-        get_parameter("passthrough_x_min").as_double(),
-        get_parameter("passthrough_x_max").as_double());
-      pass.filter(*cloud_cut);
-
-      CloudT::Ptr tmp(new CloudT);
-      pass.setInputCloud(cloud_cut);
-      pass.setFilterFieldName("z");
-      pass.setFilterLimits(
-        get_parameter("passthrough_z_min").as_double(),
-        get_parameter("passthrough_z_max").as_double());
-      pass.filter(*tmp);
-      cloud_cut.swap(tmp);
+    const auto core_begin = std::chrono::steady_clock::now();
+    CloudT::Ptr cloud_roi(new CloudT);
+    if (!depthToWorkspaceScalar(*msg, transform, *cloud_roi)) {
+      return;
     }
-
     const auto core_end = std::chrono::steady_clock::now();
-    const double core_with_lookup_ms =
+    const double core_ms =
       std::chrono::duration<double, std::milli>(core_end - core_begin).count();
-    const double core_ms = std::max(0.0, core_with_lookup_ms - tf_lookup_ms);
 
     const auto voxel_begin = std::chrono::steady_clock::now();
     CloudT::Ptr cloud_voxel(new CloudT);
     {
       pcl::VoxelGrid<PointT> vg;
-      vg.setInputCloud(cloud_cut);
+      vg.setInputCloud(cloud_roi);
       const float leaf = static_cast<float>(get_parameter("voxel_leaf_m").as_double());
       vg.setLeafSize(leaf, leaf, leaf);
       vg.filter(*cloud_voxel);
@@ -217,13 +191,48 @@ private:
     recordTiming(core_ms, voxel_ms, callback_ms);
   }
 
-  bool depthToCloudSparse(const sensor_msgs::msg::Image & depth, CloudT & cloud)
+  bool lookupTransformMatrix(
+    const std::string & frame_in,
+    const rclcpp::Time & stamp,
+    Eigen::Affine3d & transform,
+    double & tf_lookup_ms)
   {
-    // 在这里稀疏反投影depthToCloudSparse
-    // depth_stride 设置多少个像素取一个点
+    tf_lookup_ms = 0.0;
+    if (frame_in == target_frame_) {
+      transform = Eigen::Affine3d::Identity();
+      return true;
+    }
+
+    geometry_msgs::msg::TransformStamped tf;
+    const auto tf_lookup_begin = std::chrono::steady_clock::now();
+    try {
+      tf = tf_buffer_.lookupTransform(
+        target_frame_, frame_in, stamp,
+        tf2::durationFromSec(get_parameter("tf_timeout_sec").as_double()));
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "TF %s <- %s failed: %s", target_frame_.c_str(), frame_in.c_str(), ex.what());
+      return false;
+    }
+    tf_lookup_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - tf_lookup_begin).count();
+    transform = tf2::transformToEigen(tf.transform);
+    return true;
+  }
+
+  bool depthToWorkspaceScalar(
+    const sensor_msgs::msg::Image & depth,
+    const Eigen::Affine3d & transform,
+    CloudT & cloud_roi)
+  {
     const int stride = std::max(1, static_cast<int>(get_parameter("depth_stride").as_int()));
     const float zmin = static_cast<float>(get_parameter("min_depth_m").as_double());
     const float zmax = static_cast<float>(get_parameter("max_depth_m").as_double());
+    const float xmin = static_cast<float>(get_parameter("passthrough_x_min").as_double());
+    const float xmax = static_cast<float>(get_parameter("passthrough_x_max").as_double());
+    const float zmin_roi = static_cast<float>(get_parameter("passthrough_z_min").as_double());
+    const float zmax_roi = static_cast<float>(get_parameter("passthrough_z_max").as_double());
+
     const double fx = camera_info_.k[0];
     const double fy = camera_info_.k[4];
     const double cx = camera_info_.k[2];
@@ -243,18 +252,45 @@ private:
       return false;
     }
 
-    cloud.clear();
-    cloud.reserve(static_cast<size_t>((width / stride) * (height / stride)));
+    const Eigen::Matrix4d & M = transform.matrix();
+    const double r00 = M(0, 0);
+    const double r01 = M(0, 1);
+    const double r02 = M(0, 2);
+    const double tx = M(0, 3);
+    const double r10 = M(1, 0);
+    const double r11 = M(1, 1);
+    const double r12 = M(1, 2);
+    const double ty = M(1, 3);
+    const double r20 = M(2, 0);
+    const double r21 = M(2, 1);
+    const double r22 = M(2, 2);
+    const double tz = M(2, 3);
 
-    auto push_z = [&](int ui, int vi, float z) {
+    cloud_roi.clear();
+    cloud_roi.reserve(ray_x_.size() * ray_y_.size());
+
+    auto process_z = [&](int ui, int vi, float z) {
       if (!std::isfinite(z) || z < zmin || z > zmax) {
         return;
       }
+
+      const double x_camera = static_cast<double>(ray_x_[static_cast<size_t>(ui)]) * z;
+      const double y_camera = static_cast<double>(ray_y_[static_cast<size_t>(vi)]) * z;
+      const double z_camera = static_cast<double>(z);
+
+      const float x_target = static_cast<float>(r00 * x_camera + r01 * y_camera + r02 * z_camera + tx);
+      const float y_target = static_cast<float>(r10 * x_camera + r11 * y_camera + r12 * z_camera + ty);
+      const float z_target = static_cast<float>(r20 * x_camera + r21 * y_camera + r22 * z_camera + tz);
+
+      if (x_target < xmin || x_target > xmax || z_target < zmin_roi || z_target > zmax_roi) {
+        return;
+      }
+
       PointT p;
-      p.x = ray_x_[static_cast<size_t>(ui)] * z;
-      p.y = ray_y_[static_cast<size_t>(vi)] * z;
-      p.z = z;
-      cloud.push_back(p);
+      p.x = x_target;
+      p.y = y_target;
+      p.z = z_target;
+      cloud_roi.push_back(p);
     };
 
     if (depth.encoding == "16UC1" || depth.encoding == "mono16") {
@@ -266,7 +302,7 @@ private:
         const auto * row = reinterpret_cast<const uint16_t *>(
           depth.data.data() + static_cast<size_t>(v) * depth.step);
         for (int ui = 0, u = 0; u < width; u += stride, ++ui) {
-          push_z(ui, vi, static_cast<float>(row[u]) * 0.001f);
+          process_z(ui, vi, static_cast<float>(row[u]) * 0.001f);
         }
       }
     } else if (depth.encoding == "32FC1") {
@@ -278,7 +314,7 @@ private:
         const auto * row = reinterpret_cast<const float *>(
           depth.data.data() + static_cast<size_t>(v) * depth.step);
         for (int ui = 0, u = 0; u < width; u += stride, ++ui) {
-          push_z(ui, vi, row[u]);
+          process_z(ui, vi, row[u]);
         }
       }
     } else {
@@ -287,10 +323,10 @@ private:
       return false;
     }
 
-    cloud.width = cloud.size();
-    cloud.height = 1;
-    cloud.is_dense = true;
-    return !cloud.empty();
+    cloud_roi.width = cloud_roi.size();
+    cloud_roi.height = 1;
+    cloud_roi.is_dense = true;
+    return !cloud_roi.empty();
   }
 
   bool ensureRayCache(
@@ -337,47 +373,6 @@ private:
     return true;
   }
 
-  bool transformCloud(
-    const CloudT & cloud_in, const std::string & frame_in,
-    const rclcpp::Time & stamp, CloudT & cloud_out, double & tf_lookup_ms)
-  {
-    tf_lookup_ms = 0.0;
-    cloud_out.clear();
-    if (frame_in == target_frame_) {
-      cloud_out = cloud_in;
-      return true;
-    }
-
-    geometry_msgs::msg::TransformStamped tf;
-    const auto tf_lookup_begin = std::chrono::steady_clock::now();
-    try {
-      tf = tf_buffer_.lookupTransform(
-        target_frame_, frame_in, stamp,
-        tf2::durationFromSec(get_parameter("tf_timeout_sec").as_double()));
-    } catch (const tf2::TransformException & ex) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "TF %s <- %s failed: %s", target_frame_.c_str(), frame_in.c_str(), ex.what());
-      return false;
-    }
-    tf_lookup_ms = std::chrono::duration<double, std::milli>(
-      std::chrono::steady_clock::now() - tf_lookup_begin).count();
-
-    const Eigen::Affine3d T = tf2::transformToEigen(tf.transform);
-    cloud_out.reserve(cloud_in.size());
-    for (const auto & p : cloud_in.points) {
-      const Eigen::Vector3d q = T * Eigen::Vector3d(p.x, p.y, p.z);
-      PointT o;
-      o.x = static_cast<float>(q.x());
-      o.y = static_cast<float>(q.y());
-      o.z = static_cast<float>(q.z());
-      cloud_out.push_back(o);
-    }
-    cloud_out.width = cloud_out.size();
-    cloud_out.height = 1;
-    cloud_out.is_dense = true;
-    return true;
-  }
-
   std::string depth_topic_;
   std::string info_topic_;
   std::string output_topic_;
@@ -385,8 +380,8 @@ private:
   bool projection_enable_openmp_{false};
   int projection_openmp_threads_{4};
   bool projection_enable_neon_{false};
-  size_t successful_frames_{0};  // 成功处理并 publish 的帧计数。
-  std::vector<double> core_samples_;  // 预热之后，每一成功帧的三段耗时（ms）各存一份：
+  size_t successful_frames_{0};
+  std::vector<double> core_samples_;
   std::vector<double> voxel_samples_;
   std::vector<double> callback_samples_;
   bool have_info_{false};
