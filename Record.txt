@@ -197,3 +197,52 @@
     标量优化	遍历融合、射线缓存、RANSAC候选集	* ms	*×
     OpenMP	标量优化 + *线程并行	* ms	*×
     最终版本	OpenMP + AArch64 NEON	* ms	*×
+
+
+26.08.25：
+    1. 下一步准备给图像转点云  和 地面分割处进行Openmp + Neon优化， 所以准备在perception.yaml添加参数：
+        cloud_workspace_node:
+            ros__parameters:
+                projection_enable_openmp: false
+                projection_openmp_threads: 4
+                projection_enable_neon: false
+
+            pcl_obstacle_node:
+            ros__parameters:
+                ransac_enable_openmp: false
+                ransac_openmp_threads: 4
+                ransac_enable_neon: false
+
+        各自节点中接受这些新增加的节点
+
+
+    2. cloud_workspace_node.cpp 进行优化：
+        当前节点操作：
+        深度图
+        → 深度有效性过滤 + stride稀疏采样
+        → 反投影到相机坐标系
+        → TF查询
+        → 逐点坐标变换到base_link
+        → x方向PassThrough
+        → z方向PassThrough
+        → VoxelGrid体素降采样
+        → PCL转换为PointCloud2
+        → ROS发布
+
+        计划测试：
+        V0 原始 baseline
+        ↓
+        V1 射线缓存
+        ↓
+        V2 标量遍历融合
+        ├─ V3 V2 + OpenMP，NEON关闭
+        ├─ V4 V2 + NEON，OpenMP关闭
+        └─ V5 V2 + OpenMP + NEON
+
+        每个阶段测三个耗时：
+        core_p95：反投影、逐点TF、ROI这段核心计算。
+        voxel_p95：单独的 PCL VoxelGrid 耗时。
+        callback_p95：从回调开始到发布调用结束的整体耗时。  
+
+        v0: PERF V0 samples=1000 core_p95=9.385 ms voxel_p95=5.695 ms callback_p95=15.200 ms
+        v1: 

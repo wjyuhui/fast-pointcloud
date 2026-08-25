@@ -44,9 +44,15 @@ public:
     declare_parameter<int>("cluster_min_points", 20);
     declare_parameter<int>("cluster_max_points", 25000);
     declare_parameter<int>("max_clusters", 30);
+    declare_parameter<bool>("ransac_enable_openmp", false);
+    declare_parameter<int>("ransac_openmp_threads", 4);
+    declare_parameter<bool>("ransac_enable_neon", false);
 
     input_topic_ = get_parameter("input_cloud_topic").as_string();
     target_frame_ = get_parameter("target_frame").as_string();
+    ransac_enable_openmp_ = get_parameter("ransac_enable_openmp").as_bool();
+    ransac_openmp_threads_ = get_parameter("ransac_openmp_threads").as_int();
+    ransac_enable_neon_ = get_parameter("ransac_enable_neon").as_bool();
 
     rclcpp::SensorDataQoS qos;
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -63,8 +69,11 @@ public:
       "/perception/markers/obstacles", 10);
 
     RCLCPP_INFO(get_logger(),
-      "pcl_obstacle_node cloud=%s frame=%s (ground/cluster)",
-      input_topic_.c_str(), target_frame_.c_str());
+      "pcl_obstacle_node cloud=%s frame=%s (ground/cluster) openmp=%s threads=%d neon=%s",
+      input_topic_.c_str(), target_frame_.c_str(),
+      ransac_enable_openmp_ ? "true" : "false",
+      ransac_openmp_threads_,
+      ransac_enable_neon_ ? "true" : "false");
   }
 
 private:
@@ -343,6 +352,9 @@ private:
 
   std::string input_topic_;
   std::string target_frame_;
+  bool ransac_enable_openmp_{false};
+  int ransac_openmp_threads_{4};
+  bool ransac_enable_neon_{false};
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Publisher<rgbd_perception_msgs::msg::ObstacleArray>::SharedPtr obstacles_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_obstacles_pub_;

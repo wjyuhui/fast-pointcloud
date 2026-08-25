@@ -18,6 +18,9 @@ cloud_workspace_node:
     passthrough_z_max: 2.0
     voxel_leaf_m: 0.05
     tf_timeout_sec: 0.1
+    projection_enable_openmp: false
+    projection_openmp_threads: 4
+    projection_enable_neon: false
 
 pcl_obstacle_node:
   ros__parameters:
@@ -34,6 +37,9 @@ pcl_obstacle_node:
     cluster_min_points: 20
     cluster_max_points: 25000
     max_clusters: 30
+    ransac_enable_openmp: false
+    ransac_openmp_threads: 4
+    ransac_enable_neon: false
 
 bev_node:
   ros__parameters:

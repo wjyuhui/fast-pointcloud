@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <Eigen/Geometry>
 #include <pcl/filters/passthrough.h>
@@ -43,11 +44,21 @@ public:
     declare_parameter<double>("passthrough_z_max", 2.0);
     declare_parameter<double>("voxel_leaf_m", 0.05);
     declare_parameter<double>("tf_timeout_sec", 0.1);
-    
+    declare_parameter<bool>("projection_enable_openmp", false);
+    declare_parameter<int>("projection_openmp_threads", 4);
+    declare_parameter<bool>("projection_enable_neon", false);
+
     depth_topic_ = get_parameter("depth_topic").as_string();
     info_topic_ = get_parameter("camera_info_topic").as_string();
     output_topic_ = get_parameter("output_cloud_topic").as_string();
     target_frame_ = get_parameter("target_frame").as_string();
+    projection_enable_openmp_ = get_parameter("projection_enable_openmp").as_bool();
+    projection_openmp_threads_ = get_parameter("projection_openmp_threads").as_int();
+    projection_enable_neon_ = get_parameter("projection_enable_neon").as_bool();
+
+    core_samples_.reserve(kMeasureFrames);
+    voxel_samples_.reserve(kMeasureFrames);
+    callback_samples_.reserve(kMeasureFrames);
 
     rclcpp::SensorDataQoS qos;
     info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
@@ -62,23 +73,83 @@ public:
     cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(output_topic_, qos);
 
     RCLCPP_INFO(get_logger(),
-      "cloud_workspace_node depth=%s info=%s -> %s (%s)",
+      "cloud_workspace_node depth=%s info=%s -> %s (%s) openmp=%s threads=%d neon=%s",
       depth_topic_.c_str(), info_topic_.c_str(), output_topic_.c_str(),
-      target_frame_.c_str());
+      target_frame_.c_str(),
+      projection_enable_openmp_ ? "true" : "false",
+      projection_openmp_threads_,
+      projection_enable_neon_ ? "true" : "false");
+  }
+
+  ~CloudWorkspaceNode() override
+  {
+    if (core_samples_.size() >= kMinDumpFrames) {
+      logPerf();
+    }
   }
 
 private:
+  static constexpr size_t kWarmupFrames = 30;
+  static constexpr size_t kMeasureFrames = 1000;
+  static constexpr size_t kMinDumpFrames = 200;
+
+  static double calculateP95(std::vector<double> samples)
+  {
+    if (samples.empty()) {
+      return 0.0;
+    }
+
+    std::sort(samples.begin(), samples.end());
+
+    const size_t index =
+      static_cast<size_t>(std::ceil(0.95 * static_cast<double>(samples.size()))) - 1;
+    return samples[std::min(index, samples.size() - 1)];
+  }
+
+  void logPerf() const
+  {
+    RCLCPP_INFO(
+      get_logger(),
+      "PERF V0 samples=%zu core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms",
+      core_samples_.size(),
+      calculateP95(core_samples_),
+      calculateP95(voxel_samples_),
+      calculateP95(callback_samples_));
+  }
+
+  void recordTiming(double core_ms, double voxel_ms, double callback_ms)
+  {
+    ++successful_frames_;
+    if (successful_frames_ <= kWarmupFrames) {
+      return;
+    }
+
+    core_samples_.push_back(core_ms);
+    voxel_samples_.push_back(voxel_ms);
+    callback_samples_.push_back(callback_ms);
+
+    if (core_samples_.size() < kMeasureFrames) {
+      return;
+    }
+
+    logPerf();
+    core_samples_.clear();
+    voxel_samples_.clear();
+    callback_samples_.clear();
+  }
+
   void depthCallback(const sensor_msgs::msg::Image::SharedPtr msg)
   {
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto callback_begin = std::chrono::steady_clock::now();
 
     if (!have_info_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Waiting for camera_info on %s",
         info_topic_.c_str());
       return;
     }
-    
-    // 在这里稀疏反投影depthToCloudSparse
+
+    const auto core_begin = std::chrono::steady_clock::now();
+
     CloudT::Ptr cloud_cam(new CloudT);
     if (!depthToCloudSparse(*msg, *cloud_cam) || cloud_cam->empty()) {
       return;
@@ -88,8 +159,11 @@ private:
       ? msg->header.frame_id
       : camera_info_.header.frame_id;
 
+    double tf_lookup_ms = 0.0;
     CloudT::Ptr cloud_base(new CloudT);
-    if (!transformCloud(*cloud_cam, optical_frame, msg->header.stamp, *cloud_base)) {
+    if (!transformCloud(
+          *cloud_cam, optical_frame, msg->header.stamp, *cloud_base, tf_lookup_ms))
+    {
       return;
     }
 
@@ -113,7 +187,13 @@ private:
       cloud_cut.swap(tmp);
     }
 
-    CloudT::Ptr cloud_voxel(new CloudT);  // 下面整个步骤是做点云体素滤波，去掉密集点（降采样）
+    const auto core_end = std::chrono::steady_clock::now();
+    const double core_with_lookup_ms =
+      std::chrono::duration<double, std::milli>(core_end - core_begin).count();
+    const double core_ms = std::max(0.0, core_with_lookup_ms - tf_lookup_ms);
+
+    const auto voxel_begin = std::chrono::steady_clock::now();
+    CloudT::Ptr cloud_voxel(new CloudT);
     {
       pcl::VoxelGrid<PointT> vg;
       vg.setInputCloud(cloud_cut);
@@ -121,6 +201,9 @@ private:
       vg.setLeafSize(leaf, leaf, leaf);
       vg.filter(*cloud_voxel);
     }
+    const auto voxel_end = std::chrono::steady_clock::now();
+    const double voxel_ms =
+      std::chrono::duration<double, std::milli>(voxel_end - voxel_begin).count();
 
     sensor_msgs::msg::PointCloud2 out;
     pcl::toROSMsg(*cloud_voxel, out);
@@ -128,11 +211,10 @@ private:
     out.header.frame_id = target_frame_;
     cloud_pub_->publish(out);
 
-    const auto ms = std::chrono::duration<double, std::milli>(
-      std::chrono::steady_clock::now() - t0).count();
-    RCLCPP_DEBUG(get_logger(),
-      "workspace cloud %.1f ms, cam_pts=%zu voxel_pts=%zu",
-      ms, cloud_cam->size(), cloud_voxel->size());
+    const auto callback_end = std::chrono::steady_clock::now();
+    const double callback_ms =
+      std::chrono::duration<double, std::milli>(callback_end - callback_begin).count();
+    recordTiming(core_ms, voxel_ms, callback_ms);
   }
 
   bool depthToCloudSparse(const sensor_msgs::msg::Image & depth, CloudT & cloud)
@@ -212,15 +294,17 @@ private:
 
   bool transformCloud(
     const CloudT & cloud_in, const std::string & frame_in,
-    const rclcpp::Time & stamp, CloudT & cloud_out)
+    const rclcpp::Time & stamp, CloudT & cloud_out, double & tf_lookup_ms)
   {
-    cloud_out.clear();  // 为什么需要先晴空呢？本身不就是刚刚创建的吗？
+    tf_lookup_ms = 0.0;
+    cloud_out.clear();
     if (frame_in == target_frame_) {
       cloud_out = cloud_in;
       return true;
     }
 
     geometry_msgs::msg::TransformStamped tf;
+    const auto tf_lookup_begin = std::chrono::steady_clock::now();
     try {
       tf = tf_buffer_.lookupTransform(
         target_frame_, frame_in, stamp,
@@ -230,6 +314,8 @@ private:
         "TF %s <- %s failed: %s", target_frame_.c_str(), frame_in.c_str(), ex.what());
       return false;
     }
+    tf_lookup_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - tf_lookup_begin).count();
 
     const Eigen::Affine3d T = tf2::transformToEigen(tf.transform);
     cloud_out.reserve(cloud_in.size());
@@ -251,6 +337,13 @@ private:
   std::string info_topic_;
   std::string output_topic_;
   std::string target_frame_;
+  bool projection_enable_openmp_{false};
+  int projection_openmp_threads_{4};
+  bool projection_enable_neon_{false};
+  size_t successful_frames_{0};  // 成功处理并 publish 的帧计数。
+  std::vector<double> core_samples_;  // 预热之后，每一成功帧的三段耗时（ms）各存一份：
+  std::vector<double> voxel_samples_;
+  std::vector<double> callback_samples_;
   bool have_info_{false};
   sensor_msgs::msg::CameraInfo camera_info_;
   tf2_ros::Buffer tf_buffer_;
