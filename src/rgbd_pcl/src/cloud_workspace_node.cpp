@@ -9,6 +9,13 @@
 
 #include <omp.h>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define RGBD_PCL_HAS_NEON 1
+#else
+#define RGBD_PCL_HAS_NEON 0
+#endif
+
 #include <Eigen/Geometry>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/point_cloud.h>
@@ -67,6 +74,129 @@ void tryAppendPoint(
   cloud.push_back(p);
 }
 
+#if RGBD_PCL_HAS_NEON
+struct NeonWorkspaceParams
+{
+  float zmin;
+  float zmax;
+  float xmin;
+  float xmax;
+  float zmin_roi;
+  float zmax_roi;
+
+  float r00, r01, r02, tx;
+  float r10, r11, r12, ty;
+  float r20, r21, r22, tz;
+};
+
+inline uint32x4_t finiteMask(const float32x4_t z)
+{
+  const uint32x4_t bits = vreinterpretq_u32_f32(z);
+  const uint32x4_t exponent = vandq_u32(bits, vdupq_n_u32(0x7F800000u));
+  return vmvnq_u32(vceqq_u32(exponent, vdupq_n_u32(0x7F800000u)));
+}
+
+inline void appendTransformedPointsNeon4(
+  CloudT & cloud,
+  const float32x4_t z,
+  const size_t ui,
+  const size_t vi,
+  const float * ray_x,
+  const float * ray_y,
+  const NeonWorkspaceParams & params)
+{
+  const float32x4_t ray_x_vec = vld1q_f32(ray_x + ui);
+  const float32x4_t ray_y_vec = vdupq_n_f32(ray_y[vi]);
+
+  float32x4_t x_direction = vfmaq_n_f32(vdupq_n_f32(params.r02), ray_x_vec, params.r00);
+  x_direction = vfmaq_n_f32(x_direction, ray_y_vec, params.r01);
+  float32x4_t y_direction = vfmaq_n_f32(vdupq_n_f32(params.r12), ray_x_vec, params.r10);
+  y_direction = vfmaq_n_f32(y_direction, ray_y_vec, params.r11);
+  float32x4_t z_direction = vfmaq_n_f32(vdupq_n_f32(params.r22), ray_x_vec, params.r20);
+  z_direction = vfmaq_n_f32(z_direction, ray_y_vec, params.r21);
+
+  const float32x4_t x_target = vfmaq_f32(vdupq_n_f32(params.tx), z, x_direction);
+  const float32x4_t y_target = vfmaq_f32(vdupq_n_f32(params.ty), z, y_direction);
+  const float32x4_t z_target = vfmaq_f32(vdupq_n_f32(params.tz), z, z_direction);
+
+  const uint32x4_t depth_valid = vandq_u32(
+    vandq_u32(finiteMask(z), vcgeq_f32(z, vdupq_n_f32(params.zmin))),
+    vcleq_f32(z, vdupq_n_f32(params.zmax)));
+  const uint32x4_t roi_valid = vandq_u32(
+    vandq_u32(
+      vcgeq_f32(x_target, vdupq_n_f32(params.xmin)),
+      vcleq_f32(x_target, vdupq_n_f32(params.xmax))),
+    vandq_u32(
+      vcgeq_f32(z_target, vdupq_n_f32(params.zmin_roi)),
+      vcleq_f32(z_target, vdupq_n_f32(params.zmax_roi))));
+  const uint32x4_t valid_mask = vandq_u32(depth_valid, roi_valid);
+
+  alignas(16) float xs[4];
+  alignas(16) float ys[4];
+  alignas(16) float zs[4];
+  alignas(16) uint32_t valid[4];
+  vst1q_f32(xs, x_target);
+  vst1q_f32(ys, y_target);
+  vst1q_f32(zs, z_target);
+  vst1q_u32(valid, valid_mask);
+
+  for (size_t lane = 0; lane < 4; ++lane) {
+    if (valid[lane] != 0U) {
+      PointT p;
+      p.x = xs[lane];
+      p.y = ys[lane];
+      p.z = zs[lane];
+      cloud.push_back(p);
+    }
+  }
+}
+
+inline void tryAppendPointsNeon4(
+  CloudT & cloud,
+  const uint16_t * row,
+  const size_t ui,
+  const size_t vi,
+  const int stride,
+  const float * ray_x,
+  const float * ray_y,
+  const NeonWorkspaceParams & params)
+{
+  const size_t u = ui * static_cast<size_t>(stride);
+  const size_t step = static_cast<size_t>(stride);
+  alignas(16) uint32_t depth_values[4] = {
+    row[u],
+    row[u + step],
+    row[u + 2U * step],
+    row[u + 3U * step]
+  };
+  const uint32x4_t raw = vld1q_u32(depth_values);
+  const float32x4_t z = vmulq_n_f32(vcvtq_f32_u32(raw), 0.001f);
+  appendTransformedPointsNeon4(cloud, z, ui, vi, ray_x, ray_y, params);
+}
+
+inline void tryAppendPointsNeon4(
+  CloudT & cloud,
+  const float * row,
+  const size_t ui,
+  const size_t vi,
+  const int stride,
+  const float * ray_x,
+  const float * ray_y,
+  const NeonWorkspaceParams & params)
+{
+  const size_t u = ui * static_cast<size_t>(stride);
+  const size_t step = static_cast<size_t>(stride);
+  alignas(16) float depth_values[4] = {
+    row[u],
+    row[u + step],
+    row[u + 2U * step],
+    row[u + 3U * step]
+  };
+  const float32x4_t z = vld1q_f32(depth_values);
+  appendTransformedPointsNeon4(cloud, z, ui, vi, ray_x, ray_y, params);
+}
+#endif
+
 }  // namespace
 
 class CloudWorkspaceNode : public rclcpp::Node
@@ -102,10 +232,16 @@ public:
     projection_openmp_threads_ = get_parameter("projection_openmp_threads").as_int();
     projection_enable_neon_ = get_parameter("projection_enable_neon").as_bool();
 
+    if (projection_enable_openmp_ && projection_enable_neon_) {
+      throw std::invalid_argument(
+        "V4 does not support projection OpenMP and NEON at the same time");
+    }
+#if !RGBD_PCL_HAS_NEON
     if (projection_enable_neon_) {
       throw std::invalid_argument(
-        "projection_enable_neon=true is not allowed in V3 (NEON must stay off)");
+        "projection_enable_neon=true requires an AArch64 NEON build");
     }
+#endif
     if (projection_openmp_threads_ < 1 || projection_openmp_threads_ > kMaxOpenMPThreads) {
       throw std::invalid_argument(
         "projection_openmp_threads must be in [1, " + std::to_string(kMaxOpenMPThreads) + "]");
@@ -178,6 +314,14 @@ private:
         calculateP95(core_samples_),
         calculateP95(voxel_samples_),
         calculateP95(callback_samples_));
+    } else if (projection_enable_neon_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "PERF V4_NEON samples=%zu core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms",
+        core_samples_.size(),
+        calculateP95(core_samples_),
+        calculateP95(voxel_samples_),
+        calculateP95(callback_samples_));
     } else {
       RCLCPP_INFO(
         get_logger(),
@@ -232,9 +376,18 @@ private:
 
     const auto core_begin = std::chrono::steady_clock::now();
     CloudT::Ptr cloud_roi(new CloudT);
-    const bool ok = projection_enable_openmp_
-      ? depthToWorkspaceOpenMP(*msg, transform, *cloud_roi)
-      : depthToWorkspaceScalar(*msg, transform, *cloud_roi);
+    bool ok = false;
+    if (projection_enable_openmp_) {
+      ok = depthToWorkspaceOpenMP(*msg, transform, *cloud_roi);
+    } else if (projection_enable_neon_) {
+#if RGBD_PCL_HAS_NEON
+      ok = depthToWorkspaceNeon(*msg, transform, *cloud_roi);
+#else
+      ok = false;
+#endif
+    } else {
+      ok = depthToWorkspaceScalar(*msg, transform, *cloud_roi);
+    }
     if (!ok) {
       return;
     }
@@ -420,7 +573,7 @@ private:
   void prepareOpenMPBuffers(int requested_threads, size_t sampled_rows, size_t sampled_cols)
   {
     const size_t n = static_cast<size_t>(requested_threads);
-    if (omp_thread_clouds_.size() < n) {
+    if (omp_thread_clouds_.size() < n) {  // 如果设置的线程数大于数组大小，则扩容
       omp_thread_clouds_.reserve(n);
       while (omp_thread_clouds_.size() < n) {
         omp_thread_clouds_.emplace_back(new CloudT);
@@ -447,20 +600,20 @@ private:
     double r10 = 0, r11 = 0, r12 = 0, ty = 0;
     double r20 = 0, r21 = 0, r22 = 0, tz = 0;
     bool is_u16 = false;
-    if (!prepareWorkspaceInputs(
+    if (!prepareWorkspaceInputs(  // 给需要的参数赋值
           depth, transform, stride, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
           r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz, is_u16))
     {
       return false;
     }
 
-    const size_t sampled_rows = ray_y_.size();
-    const size_t sampled_cols = ray_x_.size();
+    const size_t sampled_rows = ray_y_.size();  // 行数
+    const size_t sampled_cols = ray_x_.size();  // 列数
     if (sampled_rows == 0 || sampled_cols == 0) {
       return false;
     }
 
-    prepareOpenMPBuffers(projection_openmp_threads_, sampled_rows, sampled_cols);
+    prepareOpenMPBuffers(projection_openmp_threads_, sampled_rows, sampled_cols);  // 给用于装点云的数组进行扩容
 
     const float * ray_x = ray_x_.data();
     const float * ray_y = ray_y_.data();
@@ -470,16 +623,23 @@ private:
     const int requested_threads = projection_openmp_threads_;
     int actual_threads = 0;
 
+    /**
+    #pragma omp parallel 表示后面的操作开始并行执行
+    num_threads(requested_threads) 设置并行线程数
+    default(none) 显式声明外部变量是 shared 还是 private，有利于避免数据竞争。
+    shared（。。。。。。） 表示这些变量在并行区域内共享，可以被所有线程访问和修改。
+    #pragma omp single  会保证只有一个线程执行后面的操作，其他线程等待。
+    */
 #pragma omp parallel num_threads(requested_threads) default(none) \
     shared(actual_threads, is_u16, sampled_rows, sampled_cols, stride, \
            depth_data, depth_step, ray_x, ray_y, thread_clouds, \
            zmin, zmax, xmin, xmax, zmin_roi, zmax_roi, \
            r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz)
     {
-      const int tid = omp_get_thread_num();
+      const int tid = omp_get_thread_num();  // 获取当前线程的编号
 #pragma omp single
       {
-        actual_threads = omp_get_num_threads();
+        actual_threads = omp_get_num_threads();  // 当前这个并行区里实际有多少个工作线程
       }
 
       const int team_size = actual_threads;
@@ -516,8 +676,9 @@ private:
           }
         }
       }
-    }
+    }  // 并行区结束
 
+    // 后面是合并的逻辑
     if (actual_threads != omp_actual_threads_) {
       omp_actual_threads_ = actual_threads;
       RCLCPP_INFO(
@@ -542,6 +703,88 @@ private:
     cloud_roi.is_dense = true;
     return !cloud_roi.empty();
   }
+
+#if RGBD_PCL_HAS_NEON
+  bool depthToWorkspaceNeon(
+    const sensor_msgs::msg::Image & depth,
+    const Eigen::Affine3d & transform,
+    CloudT & cloud_roi)
+  {
+    int stride = 1;
+    float zmin = 0.0f, zmax = 0.0f, xmin = 0.0f, xmax = 0.0f, zmin_roi = 0.0f, zmax_roi = 0.0f;
+    double r00 = 0, r01 = 0, r02 = 0, tx = 0;
+    double r10 = 0, r11 = 0, r12 = 0, ty = 0;
+    double r20 = 0, r21 = 0, r22 = 0, tz = 0;
+    bool is_u16 = false;
+    if (!prepareWorkspaceInputs(
+          depth, transform, stride, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
+          r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz, is_u16))
+    {
+      return false;
+    }
+
+    const size_t sampled_rows = ray_y_.size();
+    const size_t sampled_cols = ray_x_.size();
+    if (sampled_rows == 0 || sampled_cols == 0) {
+      return false;
+    }
+
+    const float * ray_x = ray_x_.data();
+    const float * ray_y = ray_y_.data();
+    const NeonWorkspaceParams params{
+      zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
+      static_cast<float>(r00), static_cast<float>(r01), static_cast<float>(r02), static_cast<float>(tx),
+      static_cast<float>(r10), static_cast<float>(r11), static_cast<float>(r12), static_cast<float>(ty),
+      static_cast<float>(r20), static_cast<float>(r21), static_cast<float>(r22), static_cast<float>(tz)
+    };
+
+    cloud_roi.clear();
+    cloud_roi.reserve(sampled_rows * sampled_cols);
+
+    if (is_u16) {
+      for (size_t vi = 0; vi < sampled_rows; ++vi) {
+        const int v = static_cast<int>(vi) * stride;
+        const auto * row = reinterpret_cast<const uint16_t *>(
+          depth.data.data() + static_cast<size_t>(v) * depth.step);
+
+        size_t ui = 0;
+        for (; ui + 3 < sampled_cols; ui += 4) {
+          tryAppendPointsNeon4(cloud_roi, row, ui, vi, stride, ray_x, ray_y, params);
+        }
+        for (; ui < sampled_cols; ++ui) {
+          const int u = static_cast<int>(ui) * stride;
+          tryAppendPoint(
+            cloud_roi, static_cast<float>(row[u]) * 0.001f, ui, vi,
+            ray_x, ray_y, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
+            r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz);
+        }
+      }
+    } else {
+      for (size_t vi = 0; vi < sampled_rows; ++vi) {
+        const int v = static_cast<int>(vi) * stride;
+        const auto * row = reinterpret_cast<const float *>(
+          depth.data.data() + static_cast<size_t>(v) * depth.step);
+
+        size_t ui = 0;
+        for (; ui + 3 < sampled_cols; ui += 4) {
+          tryAppendPointsNeon4(cloud_roi, row, ui, vi, stride, ray_x, ray_y, params);
+        }
+        for (; ui < sampled_cols; ++ui) {
+          const int u = static_cast<int>(ui) * stride;
+          tryAppendPoint(
+            cloud_roi, row[u], ui, vi,
+            ray_x, ray_y, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
+            r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz);
+        }
+      }
+    }
+
+    cloud_roi.width = cloud_roi.size();
+    cloud_roi.height = 1;
+    cloud_roi.is_dense = true;
+    return !cloud_roi.empty();
+  }
+#endif
 
   bool ensureRayCache(
     int width, int height, int stride,

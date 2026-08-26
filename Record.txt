@@ -247,3 +247,36 @@
         v0: PERF V0 samples=1000 core_p95=9.385 ms voxel_p95=5.695 ms callback_p95=15.200 ms
         v1: PERF V1 samples=1000 core_p95=8.877 ms voxel_p95=5.515 ms callback_p95=14.286 ms
         v2: PERF V2 samples=1000 core_p95=4.272 ms voxel_p95=6.408 ms callback_p95=10.859 ms
+        v3: PERF V3_OMP requested_threads=4 actual_threads=4 samples=1000 core_p95=1.566 ms voxel_p95=6.260 ms callback_p95=7.917 ms
+        v3: PERF V3_OMP requested_threads=1 actual_threads=1 samples=1000 core_p95=4.937 ms voxel_p95=5.755 ms callback_p95=10.876 ms
+        | 模式       | 线程/CPU集合 | Core p95 | Voxel p95   | Callback p95 | Core加速比 | CPU% | 温度 |
+        | V2 Scalar | 标量         | 4.272    | 6.408       | 10.859       | 1.00×      | *   | *   |
+        | V3 OMP    | 1/大核       | *        | *           | *             | *         | *   | *   |
+        | V3 OMP    | 2/大核       | *        | *         | *            | *          | *   | *   |
+        | V3 OMP    | 4/大核       | *          | *         | *            | *          | *   | *   |
+        | V3 OMP    | 6/混合       | *          | *         | *            | *          | *   | *   |
+        | V3 OMP    | 8/全核       | *           | *        | *             | *         | *   | *   |
+
+
+        v4: PERF V4_NEON samples=1000 core_p95=1.243 ms voxel_p95=6.345 ms callback_p95=7.769 ms
+
+
+
+
+
+
+
+
+
+
+
+
+        depthToWorkspaceNeon(...){
+            放射缓存有效性判断
+            数据布局{
+                通过strde + depth.data 得到 数组x 数组y 数组z ?
+            }
+            for(i, ?<? i+=4){
+                tryAppendPointsNeon4
+            }
+        }
