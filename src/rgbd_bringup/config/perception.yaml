@@ -18,7 +18,7 @@ cloud_workspace_node:
     passthrough_z_max: 2.0
     voxel_leaf_m: 0.05
     tf_timeout_sec: 0.1
-    projection_enable_openmp: false
+    projection_enable_openmp: true
     projection_openmp_threads: 4
     projection_enable_neon: false
 
