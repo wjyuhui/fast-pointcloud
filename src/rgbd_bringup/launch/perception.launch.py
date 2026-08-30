@@ -45,9 +45,17 @@ def launch_setup(context, *args, **kwargs):
         LaunchConfiguration('projection_enable_openmp').perform(context))
     projection_enable_neon = _as_bool(
         LaunchConfiguration('projection_enable_neon').perform(context))
+    projection_fuse_voxel = _as_bool(
+        LaunchConfiguration('projection_fuse_voxel').perform(context))
+    projection_fused_voxel_openmp = _as_bool(
+        LaunchConfiguration('projection_fused_voxel_openmp').perform(context))
+    projection_fused_voxel_verify = _as_bool(
+        LaunchConfiguration('projection_fused_voxel_verify').perform(context))
     projection_omp_places = LaunchConfiguration('projection_omp_places').perform(context)
     threads_raw = LaunchConfiguration('projection_openmp_threads').perform(context)
     compute_cpu_raw = LaunchConfiguration('projection_compute_cpu').perform(context)
+    chunk_raw = LaunchConfiguration('projection_voxel_chunk_rows').perform(context)
+    capacity_raw = LaunchConfiguration('projection_voxel_table_capacity').perform(context)
     try:
         projection_openmp_threads = int(threads_raw)
     except ValueError as exc:
@@ -60,6 +68,18 @@ def launch_setup(context, *args, **kwargs):
         raise RuntimeError(
             'projection_compute_cpu must be an integer, got %r' % compute_cpu_raw
         ) from exc
+    try:
+        projection_voxel_chunk_rows = int(chunk_raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            'projection_voxel_chunk_rows must be an integer, got %r' % chunk_raw
+        ) from exc
+    try:
+        projection_voxel_table_capacity = int(capacity_raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            'projection_voxel_table_capacity must be an integer, got %r' % capacity_raw
+        ) from exc
 
     if projection_openmp_threads < 1 or projection_openmp_threads > _MAX_OPENMP_THREADS:
         raise RuntimeError(
@@ -69,11 +89,31 @@ def launch_setup(context, *args, **kwargs):
         raise RuntimeError(
             'projection_compute_cpu must be in [0, %d], got %d' % (
                 _MAX_CPU_ID, projection_compute_cpu))
-    if projection_enable_openmp and projection_enable_neon:
+    if projection_voxel_chunk_rows < 1 or projection_voxel_chunk_rows > 128:
+        raise RuntimeError(
+            'projection_voxel_chunk_rows must be in [1, 128], got %d' %
+            projection_voxel_chunk_rows)
+    if (projection_voxel_table_capacity < 256 or
+            (projection_voxel_table_capacity & (projection_voxel_table_capacity - 1)) != 0 or
+            projection_voxel_table_capacity > (1 << 24)):
+        raise RuntimeError(
+            'projection_voxel_table_capacity must be a power of two in [256, 16777216], got %d' %
+            projection_voxel_table_capacity)
+    if projection_enable_openmp and projection_enable_neon and not projection_fuse_voxel:
         raise RuntimeError(
             'V3 does not support projection OpenMP and NEON at the same time')
+    if projection_fuse_voxel and projection_enable_openmp:
+        raise RuntimeError(
+            'fused voxel and V3 OpenMP cannot be enabled together')
+    if projection_fused_voxel_openmp and not projection_fuse_voxel:
+        raise RuntimeError(
+            'projection_fused_voxel_openmp requires projection_fuse_voxel:=true')
+    if projection_fuse_voxel and not projection_fused_voxel_openmp:
+        raise RuntimeError(
+            'V5 PCL-equivalent voxel requires projection_fused_voxel_openmp:=true')
+    uses_openmp_team = projection_enable_openmp or projection_fused_voxel_openmp
     place_cpus = []
-    if projection_enable_openmp:
+    if uses_openmp_team:
         if not projection_omp_places.strip():
             raise RuntimeError(
                 'projection_omp_places must not be empty when OpenMP is enabled')
@@ -106,13 +146,18 @@ def launch_setup(context, *args, **kwargs):
         'projection_openmp_threads': projection_openmp_threads,
         'projection_enable_neon': projection_enable_neon,
         'projection_compute_cpu': (
-            place_cpus[0] if projection_enable_openmp else projection_compute_cpu
+            place_cpus[0] if uses_openmp_team else projection_compute_cpu
         ),
+        'projection_fuse_voxel': projection_fuse_voxel,
+        'projection_fused_voxel_openmp': projection_fused_voxel_openmp,
+        'projection_voxel_chunk_rows': projection_voxel_chunk_rows,
+        'projection_voxel_table_capacity': projection_voxel_table_capacity,
+        'projection_fused_voxel_verify': projection_fused_voxel_verify,
     }
 
-    # 只有V3启用OpenMP时才传递非空CPU数组。
+    # 只有V3或V5并行体素启用OpenMP时才传递非空CPU数组。
     # V2/V4不传递该参数，节点使用默认空数组。
-    if projection_enable_openmp:
+    if uses_openmp_team:
         projection_parameters['projection_openmp_cpus'] = place_cpus
 
     cloud_workspace_kwargs = {
@@ -212,5 +257,10 @@ def generate_launch_description():
         DeclareLaunchArgument('projection_enable_neon', default_value='true'),
         DeclareLaunchArgument('projection_omp_places', default_value='{7}'),
         DeclareLaunchArgument('projection_compute_cpu', default_value='7'),
+        DeclareLaunchArgument('projection_fuse_voxel', default_value='false'),
+        DeclareLaunchArgument('projection_fused_voxel_openmp', default_value='false'),
+        DeclareLaunchArgument('projection_voxel_chunk_rows', default_value='8'),
+        DeclareLaunchArgument('projection_voxel_table_capacity', default_value='16384'),
+        DeclareLaunchArgument('projection_fused_voxel_verify', default_value='false'),
         OpaqueFunction(function=launch_setup),
     ])

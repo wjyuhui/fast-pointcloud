@@ -18,7 +18,8 @@ cloud_workspace_node:
     passthrough_z_max: 2.0
     voxel_leaf_m: 0.05
     tf_timeout_sec: 0.1
-    # Projection mode, thread count and CPU list are supplied by perception.launch.py.
+    # Projection mode, thread count, CPU list and V5 PCL-equivalent voxel flags are
+    # supplied by perception.launch.py. Default remains V2/V3/V4 + PCL VoxelGrid.
 
 pcl_obstacle_node:
   ros__parameters:
