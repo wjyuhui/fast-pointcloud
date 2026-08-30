@@ -9,7 +9,7 @@ cloud_workspace_node:
     camera_info_topic: /camera/color/camera_info
     output_cloud_topic: /perception/cloud_workspace
     target_frame: base_link
-    depth_stride: 4
+    depth_stride: 2
     min_depth_m: 0.2
     max_depth_m: 5.0
     passthrough_x_min: 0.2
@@ -18,9 +18,7 @@ cloud_workspace_node:
     passthrough_z_max: 2.0
     voxel_leaf_m: 0.05
     tf_timeout_sec: 0.1
-    projection_enable_openmp: false
-    projection_openmp_threads: 1
-    projection_enable_neon: true
+    # Projection mode, thread count and CPU list are supplied by perception.launch.py.
 
 pcl_obstacle_node:
   ros__parameters:
@@ -37,9 +35,13 @@ pcl_obstacle_node:
     cluster_min_points: 20
     cluster_max_points: 25000
     max_clusters: 30
+    enable_clustering: false
     ransac_enable_openmp: false
     ransac_openmp_threads: 4
     ransac_enable_neon: false
+    profiling_enable: true
+    profiling_warmup_frames: 30
+    profiling_window_frames: 1000
 
 bev_node:
   ros__parameters:

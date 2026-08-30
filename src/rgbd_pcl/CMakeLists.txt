@@ -27,6 +27,7 @@ find_package(Boost REQUIRED COMPONENTS system filesystem date_time iostreams ser
 find_package(PCL REQUIRED COMPONENTS common filters segmentation sample_consensus search kdtree)
 find_package(pcl_conversions REQUIRED)
 find_package(OpenMP REQUIRED)
+find_package(Threads REQUIRED)
 
 include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})
@@ -42,7 +43,12 @@ ament_target_dependencies(cloud_workspace_node
   rclcpp sensor_msgs geometry_msgs
   tf2 tf2_ros tf2_eigen pcl_conversions
 )
-target_link_libraries(cloud_workspace_node ${PCL_LIBRARIES} OpenMP::OpenMP_CXX)
+target_link_libraries(
+  cloud_workspace_node
+  ${PCL_LIBRARIES}
+  OpenMP::OpenMP_CXX
+  Threads::Threads
+)
 
 add_executable(pcl_obstacle_node src/pcl_obstacle_node.cpp)
 target_include_directories(pcl_obstacle_node PUBLIC

@@ -1,13 +1,27 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
+#include <exception>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include <omp.h>
+#include <sched.h>
 
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -33,6 +47,18 @@ using PointT = pcl::PointXYZ;
 using CloudT = pcl::PointCloud<PointT>;
 
 namespace {
+
+std::string formatCpuList(const std::vector<int> & cpus)
+{
+  std::string text;
+  for (size_t i = 0; i < cpus.size(); ++i) {
+    if (i != 0) {
+      text += ',';
+    }
+    text += std::to_string(cpus[i]);
+  }
+  return text;
+}
 
 void tryAppendPoint(
   CloudT & cloud,
@@ -222,7 +248,9 @@ public:
     declare_parameter<double>("tf_timeout_sec", 0.1);
     declare_parameter<bool>("projection_enable_openmp", false);
     declare_parameter<int>("projection_openmp_threads", 4);
+    declare_parameter<std::vector<int64_t>>("projection_openmp_cpus", std::vector<int64_t>{});
     declare_parameter<bool>("projection_enable_neon", false);
+    declare_parameter<int>("projection_compute_cpu", 7);
 
     depth_topic_ = get_parameter("depth_topic").as_string();
     info_topic_ = get_parameter("camera_info_topic").as_string();
@@ -230,7 +258,26 @@ public:
     target_frame_ = get_parameter("target_frame").as_string();
     projection_enable_openmp_ = get_parameter("projection_enable_openmp").as_bool();
     projection_openmp_threads_ = get_parameter("projection_openmp_threads").as_int();
+    const std::vector<int64_t> configured_cpus =
+      get_parameter("projection_openmp_cpus").as_integer_array();
+    projection_openmp_cpus_.reserve(configured_cpus.size());
+    for (const int64_t cpu : configured_cpus) {
+      if (cpu < 0 || cpu >= CPU_SETSIZE) {
+        throw std::invalid_argument(
+                "projection_openmp_cpus contains an invalid CPU: " + std::to_string(cpu));
+      }
+      const int cpu_id = static_cast<int>(cpu);
+      if (std::find(
+          projection_openmp_cpus_.begin(), projection_openmp_cpus_.end(), cpu_id) !=
+        projection_openmp_cpus_.end())
+      {
+        throw std::invalid_argument(
+                "projection_openmp_cpus must not contain duplicate CPUs");
+      }
+      projection_openmp_cpus_.push_back(cpu_id);
+    }
     projection_enable_neon_ = get_parameter("projection_enable_neon").as_bool();
+    projection_compute_cpu_ = get_parameter("projection_compute_cpu").as_int();
 
     if (projection_enable_openmp_ && projection_enable_neon_) {
       throw std::invalid_argument(
@@ -246,18 +293,33 @@ public:
       throw std::invalid_argument(
         "projection_openmp_threads must be in [1, " + std::to_string(kMaxOpenMPThreads) + "]");
     }
+    if (projection_enable_openmp_ &&
+      projection_openmp_cpus_.size() != static_cast<size_t>(projection_openmp_threads_))
+    {
+      throw std::invalid_argument(
+              "projection_openmp_cpus count must match projection_openmp_threads");
+    }
+    if (projection_compute_cpu_ < 0 || projection_compute_cpu_ >= CPU_SETSIZE) {
+      throw std::invalid_argument(
+        "projection_compute_cpu must be in [0, " + std::to_string(CPU_SETSIZE - 1) + "]");
+    }
+    if (projection_enable_openmp_) {
+      projection_compute_cpu_ = projection_openmp_cpus_.front();
+    }
 
-    omp_set_dynamic(0);
-    omp_set_nested(0);
+    // omp_set_dynamic(0);
+    // omp_set_nested(0);
 
     core_samples_.reserve(kMeasureFrames);
     voxel_samples_.reserve(kMeasureFrames);
     callback_samples_.reserve(kMeasureFrames);
+    queue_wait_samples_.reserve(kMeasureFrames);
 
     rclcpp::SensorDataQoS qos;
     info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
       info_topic_, qos,
       [this](const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(camera_info_mutex_);
         camera_info_ = *msg;
         have_info_ = true;
       });
@@ -267,16 +329,38 @@ public:
     cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(output_topic_, qos);
 
     RCLCPP_INFO(get_logger(),
-      "cloud_workspace_node depth=%s info=%s -> %s (%s) openmp=%s requested_threads=%d neon=%s",
+      "cloud_workspace_node depth=%s info=%s -> %s (%s) openmp=%s requested_threads=%d neon=%s compute_cpu=%d",
       depth_topic_.c_str(), info_topic_.c_str(), output_topic_.c_str(),
       target_frame_.c_str(),
       projection_enable_openmp_ ? "true" : "false",
       projection_openmp_threads_,
-      projection_enable_neon_ ? "true" : "false");
+      projection_enable_neon_ ? "true" : "false",
+      projection_compute_cpu_);
+    if (projection_enable_openmp_) {
+      const char * bind = std::getenv("OMP_PROC_BIND");
+      RCLCPP_INFO(
+        get_logger(),
+        "OpenMP manual affinity cpus=%s OMP_PROC_BIND=%s OMP_DYNAMIC=FALSE",
+        formatCpuList(projection_openmp_cpus_).c_str(),
+        bind != nullptr ? bind : "(unset)");
+    }
+
+    compute_thread_ = std::thread(&CloudWorkspaceNode::computeLoop, this);
   }
 
   ~CloudWorkspaceNode() override
   {
+    {
+      std::lock_guard<std::mutex> lock(job_mutex_);
+      stop_requested_ = true;
+      pending_job_.reset();
+    }
+    job_cv_.notify_all();
+
+    if (compute_thread_.joinable()) {
+      compute_thread_.join();
+    }
+
     if (core_samples_.size() >= kMinDumpFrames) {
       logPerf();
     }
@@ -287,6 +371,14 @@ private:
   static constexpr size_t kMeasureFrames = 1000;
   static constexpr size_t kMinDumpFrames = 200;
   static constexpr int kMaxOpenMPThreads = 16;
+
+  struct FrameJob
+  {
+    sensor_msgs::msg::Image::SharedPtr depth;
+    sensor_msgs::msg::CameraInfo camera_info;
+    std::chrono::steady_clock::time_point pipeline_begin;
+    uint64_t sequence{0};
+  };
 
   static double calculateP95(std::vector<double> samples)
   {
@@ -303,43 +395,117 @@ private:
 
   void logPerf() const
   {
+    const char * affinity_ok = (compute_affinity_valid_ && omp_affinity_valid_) ? "true" : "false";
     if (projection_enable_openmp_) {
       RCLCPP_INFO(
         get_logger(),
-        "PERF V3_OMP requested_threads=%d actual_threads=%d samples=%zu "
-        "core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms",
+        "PERF V3_OMP requested_threads=%d actual_threads=%d affinity_ok=%s samples=%zu "
+        "queue_wait_p95=%.3f ms core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms "
+        "submitted=%lu processed=%lu dropped_pending=%lu",
         projection_openmp_threads_,
         omp_actual_threads_,
+        affinity_ok,
         core_samples_.size(),
+        calculateP95(queue_wait_samples_),
         calculateP95(core_samples_),
         calculateP95(voxel_samples_),
-        calculateP95(callback_samples_));
+        calculateP95(callback_samples_),
+        static_cast<unsigned long>(submitted_frames_.load()),
+        static_cast<unsigned long>(processed_frames_.load()),
+        static_cast<unsigned long>(dropped_pending_frames_.load()));
+      if (!compute_affinity_valid_ || !omp_affinity_valid_) {
+        RCLCPP_WARN(
+          get_logger(),
+          "PERF V3_OMP result is invalid because compute/OpenMP affinity failed");
+      }
     } else if (projection_enable_neon_) {
       RCLCPP_INFO(
         get_logger(),
-        "PERF V4_NEON samples=%zu core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms",
+        "PERF V4_NEON affinity_ok=%s samples=%zu "
+        "queue_wait_p95=%.3f ms core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms "
+        "submitted=%lu processed=%lu dropped_pending=%lu",
+        affinity_ok,
         core_samples_.size(),
+        calculateP95(queue_wait_samples_),
         calculateP95(core_samples_),
         calculateP95(voxel_samples_),
-        calculateP95(callback_samples_));
+        calculateP95(callback_samples_),
+        static_cast<unsigned long>(submitted_frames_.load()),
+        static_cast<unsigned long>(processed_frames_.load()),
+        static_cast<unsigned long>(dropped_pending_frames_.load()));
+      if (!compute_affinity_valid_) {
+        RCLCPP_WARN(
+          get_logger(),
+          "PERF V4_NEON result is invalid because compute-thread affinity failed");
+      }
     } else {
       RCLCPP_INFO(
         get_logger(),
-        "PERF V2_SCALAR samples=%zu core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms",
+        "PERF V2_SCALAR affinity_ok=%s samples=%zu "
+        "queue_wait_p95=%.3f ms core_p95=%.3f ms voxel_p95=%.3f ms callback_p95=%.3f ms "
+        "submitted=%lu processed=%lu dropped_pending=%lu",
+        affinity_ok,
         core_samples_.size(),
+        calculateP95(queue_wait_samples_),
         calculateP95(core_samples_),
         calculateP95(voxel_samples_),
-        calculateP95(callback_samples_));
+        calculateP95(callback_samples_),
+        static_cast<unsigned long>(submitted_frames_.load()),
+        static_cast<unsigned long>(processed_frames_.load()),
+        static_cast<unsigned long>(dropped_pending_frames_.load()));
+      if (!compute_affinity_valid_) {
+        RCLCPP_WARN(
+          get_logger(),
+          "PERF V2_SCALAR result is invalid because compute-thread affinity failed");
+      }
     }
   }
 
-  void recordTiming(double core_ms, double voxel_ms, double callback_ms)
+  void logOmpAffinity(int actual_threads)
+  {
+    RCLCPP_INFO(
+      get_logger(),
+      "OMP_AFFINITY requested=%d actual=%d manual_cpus=%s",
+      projection_openmp_threads_,
+      actual_threads,
+      formatCpuList(projection_openmp_cpus_).c_str());
+
+    omp_affinity_valid_ = actual_threads == projection_openmp_threads_;
+    if (!omp_affinity_valid_) {
+      if (actual_threads != projection_openmp_threads_) {
+        RCLCPP_WARN(
+          get_logger(),
+          "OMP_AFFINITY actual_threads=%d != requested_threads=%d; this run is invalid",
+          actual_threads, projection_openmp_threads_);
+      }
+    }
+
+    for (int tid = 0; tid < actual_threads; ++tid) {
+      const int cpu = omp_cpu_by_thread_[static_cast<size_t>(tid)];
+      const int target_cpu = projection_openmp_cpus_[static_cast<size_t>(tid)];
+      const int affinity_error = omp_affinity_errors_[static_cast<size_t>(tid)];
+      RCLCPP_INFO(
+        get_logger(),
+        "OMP_AFFINITY tid=%d target_cpu=%d cpu=%d set_error=%d",
+        tid, target_cpu, cpu, affinity_error);
+      if (affinity_error != 0 || cpu != target_cpu) {
+        omp_affinity_valid_ = false;
+        RCLCPP_WARN(
+          get_logger(),
+          "OMP_AFFINITY tid=%d target_cpu=%d cpu=%d set_error=%d; this run is invalid",
+          tid, target_cpu, cpu, affinity_error);
+      }
+    }
+  }
+
+  void recordTiming(double queue_wait_ms, double core_ms, double voxel_ms, double callback_ms)
   {
     ++successful_frames_;
     if (successful_frames_ <= kWarmupFrames) {
       return;
     }
 
+    queue_wait_samples_.push_back(queue_wait_ms);
     core_samples_.push_back(core_ms);
     voxel_samples_.push_back(voxel_ms);
     callback_samples_.push_back(callback_ms);
@@ -349,6 +515,7 @@ private:
     }
 
     logPerf();
+    queue_wait_samples_.clear();
     core_samples_.clear();
     voxel_samples_.clear();
     callback_samples_.clear();
@@ -356,47 +523,146 @@ private:
 
   void depthCallback(const sensor_msgs::msg::Image::SharedPtr msg)
   {
-    const auto callback_begin = std::chrono::steady_clock::now();
+    const auto pipeline_begin = std::chrono::steady_clock::now();
 
-    if (!have_info_) {
+    bool have_info = false;
+    sensor_msgs::msg::CameraInfo camera_info_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(camera_info_mutex_);
+      have_info = have_info_;
+      if (have_info) {
+        camera_info_snapshot = camera_info_;
+      }
+    }
+    if (!have_info) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Waiting for camera_info on %s",
         info_topic_.c_str());
       return;
     }
 
-    const std::string optical_frame = camera_info_.header.frame_id.empty()
-      ? msg->header.frame_id
-      : camera_info_.header.frame_id;
+    FrameJob job;
+    job.depth = msg;
+    job.camera_info = std::move(camera_info_snapshot);
+    job.pipeline_begin = pipeline_begin;
+    job.sequence = submitted_frames_.fetch_add(1) + 1;
+
+    {
+      std::lock_guard<std::mutex> lock(job_mutex_);
+      if (stop_requested_) {
+        return;
+      }
+      if (pending_job_.has_value()) {
+        dropped_pending_frames_.fetch_add(1);
+      }
+      pending_job_ = std::move(job);
+    }
+
+    job_cv_.notify_one();
+  }
+
+  bool bindCurrentThreadToCpu(int cpu, int & error)
+  {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(cpu, &mask);
+
+    if (sched_setaffinity(0, sizeof(mask), &mask) != 0) {
+      error = errno;
+      return false;
+    }
+
+    error = 0;
+    return true;
+  }
+
+  void computeLoop()
+  {
+    const int coordinator_cpu = projection_enable_openmp_
+      ? projection_openmp_cpus_.front()
+      : projection_compute_cpu_;
+
+    int bind_error = 0;
+    if (!bindCurrentThreadToCpu(coordinator_cpu, bind_error)) {
+      compute_affinity_valid_ = false;
+      RCLCPP_ERROR(
+        get_logger(),
+        "COMPUTE_THREAD bind failed target_cpu=%d actual_cpu=%d errno=%d",
+        coordinator_cpu, sched_getcpu(), bind_error);
+    } else {
+      RCLCPP_INFO(
+        get_logger(),
+        "COMPUTE_THREAD target_cpu=%d actual_cpu=%d",
+        coordinator_cpu, sched_getcpu());
+    }
+
+    while (true) {
+      FrameJob job;
+      {
+        std::unique_lock<std::mutex> lock(job_mutex_);
+        job_cv_.wait(lock, [this]() {
+          return stop_requested_ || pending_job_.has_value();
+        });
+
+        if (stop_requested_) {
+          return;
+        }
+
+        job = std::move(*pending_job_);
+        pending_job_.reset();
+      }
+
+      const auto compute_begin = std::chrono::steady_clock::now();
+      const double queue_wait_ms =
+        std::chrono::duration<double, std::milli>(
+          compute_begin - job.pipeline_begin).count();
+
+      try {
+        if (processFrame(job, queue_wait_ms)) {
+          processed_frames_.fetch_add(1);
+        }
+      } catch (const std::exception & ex) {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "Compute thread frame failed: %s", ex.what());
+      }
+    }
+  }
+
+  bool processFrame(const FrameJob & job, double queue_wait_ms)
+  {
+    const std::string optical_frame = job.camera_info.header.frame_id.empty()
+      ? job.depth->header.frame_id
+      : job.camera_info.header.frame_id;
 
     Eigen::Affine3d transform = Eigen::Affine3d::Identity();
     double tf_lookup_ms = 0.0;
-    if (!lookupTransformMatrix(optical_frame, msg->header.stamp, transform, tf_lookup_ms)) {
-      return;
+    if (!lookupTransformMatrix(optical_frame, job.depth->header.stamp, transform, tf_lookup_ms)) {
+      return false;
     }
 
     const auto core_begin = std::chrono::steady_clock::now();
     CloudT::Ptr cloud_roi(new CloudT);
     bool ok = false;
     if (projection_enable_openmp_) {
-      ok = depthToWorkspaceOpenMP(*msg, transform, *cloud_roi);
+      ok = depthToWorkspaceOpenMP(*job.depth, job.camera_info, transform, *cloud_roi);
     } else if (projection_enable_neon_) {
 #if RGBD_PCL_HAS_NEON
-      ok = depthToWorkspaceNeon(*msg, transform, *cloud_roi);
+      ok = depthToWorkspaceNeon(*job.depth, job.camera_info, transform, *cloud_roi);
 #else
       ok = false;
 #endif
     } else {
-      ok = depthToWorkspaceScalar(*msg, transform, *cloud_roi);
+      ok = depthToWorkspaceScalar(*job.depth, job.camera_info, transform, *cloud_roi);
     }
     if (!ok) {
-      return;
+      return false;
     }
     const auto core_end = std::chrono::steady_clock::now();
     const double core_ms =
       std::chrono::duration<double, std::milli>(core_end - core_begin).count();
 
     const auto voxel_begin = std::chrono::steady_clock::now();
-    CloudT::Ptr cloud_voxel(new CloudT);
+    CloudT::Ptr cloud_voxel(new CloudT);  // 通过PCL做的体素滤波
     {
       pcl::VoxelGrid<PointT> vg;
       vg.setInputCloud(cloud_roi);
@@ -410,14 +676,15 @@ private:
 
     sensor_msgs::msg::PointCloud2 out;
     pcl::toROSMsg(*cloud_voxel, out);
-    out.header.stamp = msg->header.stamp;
+    out.header.stamp = job.depth->header.stamp;
     out.header.frame_id = target_frame_;
     cloud_pub_->publish(out);
 
     const auto callback_end = std::chrono::steady_clock::now();
     const double callback_ms =
-      std::chrono::duration<double, std::milli>(callback_end - callback_begin).count();
-    recordTiming(core_ms, voxel_ms, callback_ms);
+      std::chrono::duration<double, std::milli>(callback_end - job.pipeline_begin).count();
+    recordTiming(queue_wait_ms, core_ms, voxel_ms, callback_ms);
+    return true;
   }
 
   bool lookupTransformMatrix(
@@ -451,6 +718,7 @@ private:
 
   bool prepareWorkspaceInputs(
     const sensor_msgs::msg::Image & depth,
+    const sensor_msgs::msg::CameraInfo & camera_info,
     const Eigen::Affine3d & transform,
     int & stride,
     float & zmin,
@@ -472,10 +740,10 @@ private:
     zmin_roi = static_cast<float>(get_parameter("passthrough_z_min").as_double());
     zmax_roi = static_cast<float>(get_parameter("passthrough_z_max").as_double());
 
-    const double fx = camera_info_.k[0];
-    const double fy = camera_info_.k[4];
-    const double cx = camera_info_.k[2];
-    const double cy = camera_info_.k[5];
+    const double fx = camera_info.k[0];
+    const double fy = camera_info.k[4];
+    const double cx = camera_info.k[2];
+    const double cy = camera_info.k[5];
     if (!(fx > 1e-6 && fy > 1e-6)) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Invalid camera_info intrinsics");
       return false;
@@ -487,7 +755,7 @@ private:
       return false;
     }
 
-    if (!ensureRayCache(width, height, stride, fx, fy, cx, cy)) {
+    if (!ensureRayCache(camera_info, width, height, stride, fx, fy, cx, cy)) {
       return false;
     }
 
@@ -514,6 +782,7 @@ private:
 
   bool depthToWorkspaceScalar(
     const sensor_msgs::msg::Image & depth,
+    const sensor_msgs::msg::CameraInfo & camera_info,
     const Eigen::Affine3d & transform,
     CloudT & cloud_roi)
   {
@@ -524,7 +793,7 @@ private:
     double r20 = 0, r21 = 0, r22 = 0, tz = 0;
     bool is_u16 = false;
     if (!prepareWorkspaceInputs(
-          depth, transform, stride, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
+          depth, camera_info, transform, stride, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
           r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz, is_u16))
     {
       return false;
@@ -587,10 +856,16 @@ private:
         omp_thread_clouds_[i]->points.reserve(cap);
       }
     }
+
+    if (omp_cpu_by_thread_.size() != n) {
+      omp_cpu_by_thread_.assign(n, -1);
+      omp_affinity_errors_.assign(n, 0);
+    }
   }
 
   bool depthToWorkspaceOpenMP(
     const sensor_msgs::msg::Image & depth,
+    const sensor_msgs::msg::CameraInfo & camera_info,
     const Eigen::Affine3d & transform,
     CloudT & cloud_roi)
   {
@@ -601,7 +876,7 @@ private:
     double r20 = 0, r21 = 0, r22 = 0, tz = 0;
     bool is_u16 = false;
     if (!prepareWorkspaceInputs(  // 给需要的参数赋值
-          depth, transform, stride, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
+          depth, camera_info, transform, stride, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
           r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz, is_u16))
     {
       return false;
@@ -622,10 +897,16 @@ private:
     std::vector<CloudT::Ptr> * thread_clouds = &omp_thread_clouds_;
     const int requested_threads = projection_openmp_threads_;
     int actual_threads = 0;
+    bool capture_affinity = !omp_affinity_logged_;
+    int * cpu_by_thread = omp_cpu_by_thread_.data();
+    int * affinity_errors = omp_affinity_errors_.data();
+    const int * target_cpus = projection_openmp_cpus_.data();
 
     /**
     #pragma omp parallel 表示后面的操作开始并行执行
     num_threads(requested_threads) 设置并行线程数
+    每个线程通过 sched_setaffinity 只绑定自身，不改变 ROS/FastDDS 线程亲和性。
+    tid0 是持久计算协调线程，只在第一次进入并行区时绑定到目标大核。
     default(none) 显式声明外部变量是 shared 还是 private，有利于避免数据竞争。
     shared（。。。。。。） 表示这些变量在并行区域内共享，可以被所有线程访问和修改。
     #pragma omp single  会保证只有一个线程执行后面的操作，其他线程等待。
@@ -634,12 +915,32 @@ private:
     shared(actual_threads, is_u16, sampled_rows, sampled_cols, stride, \
            depth_data, depth_step, ray_x, ray_y, thread_clouds, \
            zmin, zmax, xmin, xmax, zmin_roi, zmax_roi, \
-           r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz)
+           r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz, \
+           capture_affinity, cpu_by_thread, affinity_errors, target_cpus)
     {
       const int tid = omp_get_thread_num();  // 获取当前线程的编号
 #pragma omp single
       {
         actual_threads = omp_get_num_threads();  // 当前这个并行区里实际有多少个工作线程
+      }
+
+      cpu_set_t compute_affinity;
+      CPU_ZERO(&compute_affinity);
+      CPU_SET(target_cpus[tid], &compute_affinity);
+      // libgomp keeps all team threads alive between parallel regions. Bind
+      // each one once and only rebind it when the configured target changes.
+      static thread_local int bound_compute_cpu = -1;
+      if (bound_compute_cpu == target_cpus[tid]) {
+        affinity_errors[tid] = 0;
+      } else if (sched_setaffinity(0, sizeof(compute_affinity), &compute_affinity) != 0) {
+        affinity_errors[tid] = errno;
+      } else {
+        affinity_errors[tid] = 0;
+        bound_compute_cpu = target_cpus[tid];
+      }
+
+      if (capture_affinity) {
+        cpu_by_thread[tid] = sched_getcpu();
       }
 
       const int team_size = actual_threads;
@@ -678,6 +979,11 @@ private:
       }
     }  // 并行区结束
 
+    if (!omp_affinity_logged_) {
+      logOmpAffinity(actual_threads);
+      omp_affinity_logged_ = true;
+    }
+
     // 后面是合并的逻辑
     if (actual_threads != omp_actual_threads_) {
       omp_actual_threads_ = actual_threads;
@@ -707,6 +1013,7 @@ private:
 #if RGBD_PCL_HAS_NEON
   bool depthToWorkspaceNeon(
     const sensor_msgs::msg::Image & depth,
+    const sensor_msgs::msg::CameraInfo & camera_info,
     const Eigen::Affine3d & transform,
     CloudT & cloud_roi)
   {
@@ -717,7 +1024,7 @@ private:
     double r20 = 0, r21 = 0, r22 = 0, tz = 0;
     bool is_u16 = false;
     if (!prepareWorkspaceInputs(
-          depth, transform, stride, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
+          depth, camera_info, transform, stride, zmin, zmax, xmin, xmax, zmin_roi, zmax_roi,
           r00, r01, r02, tx, r10, r11, r12, ty, r20, r21, r22, tz, is_u16))
     {
       return false;
@@ -787,17 +1094,18 @@ private:
 #endif
 
   bool ensureRayCache(
+    const sensor_msgs::msg::CameraInfo & camera_info,
     int width, int height, int stride,
     double fx, double fy, double cx, double cy)
   {
-    if (camera_info_.width > 0 && camera_info_.height > 0 &&
-        (static_cast<int>(camera_info_.width) != width ||
-         static_cast<int>(camera_info_.height) != height))
+    if (camera_info.width > 0 && camera_info.height > 0 &&
+        (static_cast<int>(camera_info.width) != width ||
+         static_cast<int>(camera_info.height) != height))
     {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "depth size %dx%d != camera_info %ux%u",
-        width, height, camera_info_.width, camera_info_.height);
+        width, height, camera_info.width, camera_info.height);
       return false;
     }
 
@@ -836,14 +1144,36 @@ private:
   std::string target_frame_;
   bool projection_enable_openmp_{false};
   int projection_openmp_threads_{4};
+  std::vector<int> projection_openmp_cpus_;
   bool projection_enable_neon_{false};
+  int projection_compute_cpu_{7};
   int omp_actual_threads_{0};
   std::vector<CloudT::Ptr> omp_thread_clouds_;
+  std::vector<int> omp_cpu_by_thread_;
+  std::vector<int> omp_affinity_errors_;
+  bool omp_affinity_logged_{false};
+  bool omp_affinity_valid_{true};
+  bool compute_affinity_valid_{true};
   size_t successful_frames_{0};
+  std::vector<double> queue_wait_samples_;
   std::vector<double> core_samples_;
   std::vector<double> voxel_samples_;
   std::vector<double> callback_samples_;
+
+  std::mutex camera_info_mutex_;
   bool have_info_{false};
+  sensor_msgs::msg::CameraInfo camera_info_;
+
+  std::mutex job_mutex_;
+  std::condition_variable job_cv_;
+  std::optional<FrameJob> pending_job_;
+  bool stop_requested_{false};  // 只在job_mutex_保护下访问
+  std::thread compute_thread_;
+
+  std::atomic<uint64_t> submitted_frames_{0};
+  std::atomic<uint64_t> processed_frames_{0};
+  std::atomic<uint64_t> dropped_pending_frames_{0};
+
   std::vector<float> ray_x_;
   std::vector<float> ray_y_;
   int cached_width_{0};
@@ -853,7 +1183,6 @@ private:
   double cached_fy_{0.0};
   double cached_cx_{0.0};
   double cached_cy_{0.0};
-  sensor_msgs::msg::CameraInfo camera_info_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;

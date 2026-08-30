@@ -134,3 +134,19 @@ ros2 bag record -o cam_$(date +%Y%m%d_%H%M%S) \
 第二层：
   /camera/depth/points 
   /camera/depth_registered/points 
+
+--------------------------------------------------
+2026.8.30 启动命令
+ros2 launch rgbd_bringup perception.launch.py \
+  use_orbbec:=false \
+  enable_yolo:=false \
+  projection_enable_openmp:=true \
+  projection_openmp_threads:=4 \
+  projection_enable_neon:=false \
+  projection_omp_places:='{4},{5},{6},{7}'
+
+ros2 launch rgbd_bringup perception.launch.py \
+  use_orbbec:=false \
+  enable_yolo:=false \
+  projection_enable_openmp:=false \
+  projection_enable_neon:=false \

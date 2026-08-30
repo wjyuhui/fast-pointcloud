@@ -244,11 +244,128 @@
         voxel_p95：单独的 PCL VoxelGrid 耗时。
         callback_p95：从回调开始到发布调用结束的整体耗时。  
 
-        v0: PERF V0 samples=1000 core_p95=9.385 ms voxel_p95=5.695 ms callback_p95=15.200 ms
-        v1: PERF V1 samples=1000 core_p95=8.877 ms voxel_p95=5.515 ms callback_p95=14.286 ms
-        v2: PERF V2 samples=1000 core_p95=4.272 ms voxel_p95=6.408 ms callback_p95=10.859 ms
-        v3: PERF V3_OMP requested_threads=4 actual_threads=4 samples=1000 core_p95=1.566 ms voxel_p95=6.260 ms callback_p95=7.917 ms
-        v3: PERF V3_OMP requested_threads=1 actual_threads=1 samples=1000 core_p95=4.937 ms voxel_p95=5.755 ms callback_p95=10.876 ms
+        # v0: PERF V0 samples=1000 core_p95=9.385 ms voxel_p95=5.695 ms callback_p95=15.200 ms
+        # v1: PERF V1 samples=1000 core_p95=8.877 ms voxel_p95=5.515 ms callback_p95=14.286 ms
+        # v2: PERF V2 samples=1000 core_p95=4.272 ms voxel_p95=6.408 ms callback_p95=10.859 ms
+        # v3: PERF V3_OMP requested_threads=4 actual_threads=4 samples=1000 core_p95=1.566 ms voxel_p95=6.260 ms callback_p95=7.917 ms
+        # v3: PERF V3_OMP requested_threads=1 actual_threads=1 samples=1000 core_p95=4.937 ms voxel_p95=5.755 ms callback_p95=10.876 ms
+        以上高教园测的
+        ---------------
+        # 下面的数据都是固定包进行测试，保证点云数据一致性
+        v2: PERF V2_SCALAR samples=1000 core_p95=3.219 ms voxel_p95=5.025 ms callback_p95=8.522 ms
+        PERF V2_SCALAR affinity_ok=true samples=1000 queue_wait_p95=0.141 ms core_p95=0.853 ms voxel_p95=2.012 ms callback_p95=3.148 ms submitted=2030 processed=2029 dropped_pending=0
+        v3【1/小核】: PERF V3_OMP requested_threads=1 actual_threads=1 affinity_ok=true samples=1000 core_p95=4.839 ms voxel_p95=5.170 ms callback_p95=10.238 ms
+        v3【1/大核】: PERF V3_OMP requested_threads=1 actual_threads=1 affinity_ok=true samples=1000 core_p95=1.323 ms voxel_p95=2.188 ms callback_p95=18.171 ms
+        v3【2/大核】: PERF V3_OMP requested_threads=2 actual_threads=2 affinity_ok=true samples=1000 core_p95=0.884 ms voxel_p95=2.143 ms callback_p95=17.802 ms
+        v3【4/大核】: PERF V3_OMP requested_threads=4 actual_threads=4 affinity_ok=true samples=1000 core_p95=0.636 ms voxel_p95=2.221 ms callback_p95=17.565 ms
+        PERF V3_OMP requested_threads=4 actual_threads=4 affinity_ok=true samples=1000 queue_wait_p95=0.132 ms core_p95=0.662 ms voxel_p95=2.239 ms callback_p95=3.339 ms submitted=1030 processed=1029 dropped_pending=0
+        v3【6/混合】: PERF V3_OMP PERF V3_OMP requested_threads=6 actual_threads=6 affinity_ok=true samples=1000 core_p95=14.249 ms voxel_p95=2.173 ms callback_p95=16.344 ms
+        v3【8/全核】: PERF V3_OMP requested_threads=8 actual_threads=8 affinity_ok=true samples=1000 core_p95=5.790 ms voxel_p95=6.773 ms callback_p95=25.485 ms
+        v4: PERF V4_NEON samples=1000 core_p95=1.227 ms voxel_p95=5.041 ms callback_p95=6.531 ms
+        PERF V4_NEON affinity_ok=true samples=1000 queue_wait_p95=0.130 ms core_p95=0.583 ms voxel_p95=1.991 ms callback_p95=2.880 ms submitted=1030 processed=1029 dropped_pending=0
+        # 暂时解释下为什么callback_p95会因为加入了OpenMP而增加：
+        v3时的CPU分布：
+        主线程：CPU0
+        所有ROS/FASTDDS进程：CPU0
+        OPENMP： CPU0~7
+        所以CPU0上的接受和发布会竞态。
+        # 以上分布是怎么找到的呢？
+        # ps -eo pid,etime,psr,pcpu,args | grep cloud_workspace_node  找到该进程的PID 
+        # cat@lubancat:~$ taskset -pc 50761
+            pid 50761 的当前亲和力列表：0
+            得到该进程的亲和力
+
+            cat@lubancat:~$ ps -L -p 50761 -o pid,tid,psr,pcpu,stat,wchan,comm
+                PID     TID PSR %CPU STAT WCHAN  COMMAND
+            50761   50761   0  1.5 Sl+  futex_ cloud_workspace
+            50761   50785   0  0.0 Sl+  futex_ cloud_workspace
+            50761   50786   0  0.0 Sl+  futex_ cloud_workspace
+            50761   50787   0  0.0 Sl+  futex_ cloud_workspace
+            50761   50788   0  0.0 Sl+  skb_wa cloud_workspace
+            50761   50789   0  0.0 Sl+  skb_wa cloud_workspace
+            50761   50790   0  3.1 Sl+  skb_wa cloud_workspace
+            50761   50791   0  0.0 Sl+  futex_ cloud_workspace
+            50761   50792   0  0.6 Sl+  futex_ cloud_workspace
+            50761   50793   0  0.0 Sl+  futex_ cloud_workspace
+            50761   50803   0  0.0 Sl+  futex_ cloud_workspace
+            50761   50809   1  0.1 Sl+  futex_ cloud_workspace
+            50761   50810   2  0.1 Sl+  futex_ cloud_workspace
+            50761   50811   3  0.1 Sl+  futex_ cloud_workspace
+            50761   50812   4  0.0 Sl+  futex_ cloud_workspace
+            50761   50813   5  0.0 Sl+  futex_ cloud_workspace
+            50761   50814   6  0.0 Sl+  futex_ cloud_workspace
+            50761   50815   7  0.0 Sl+  futex_ cloud_workspace
+            cat@lubancat:~$ for task_status in /proc/50761/task/*/status; do
+            awk '/^Pid:|^Cpus_allowed_list:/' "$task_status"
+            done
+            Pid:    50761
+            Cpus_allowed_list:      0
+            Pid:    50785
+            Cpus_allowed_list:      0
+            Pid:    50786
+            Cpus_allowed_list:      0
+            Pid:    50787
+            Cpus_allowed_list:      0
+            Pid:    50788
+            Cpus_allowed_list:      0
+            Pid:    50789
+            Cpus_allowed_list:      0
+            Pid:    50790
+            Cpus_allowed_list:      0
+            Pid:    50791
+            Cpus_allowed_list:      0
+            Pid:    50792
+            Cpus_allowed_list:      0
+            Pid:    50793
+            Cpus_allowed_list:      0
+            Pid:    50803
+            Cpus_allowed_list:      0
+            Pid:    50809
+            Cpus_allowed_list:      1
+            Pid:    50810
+            Cpus_allowed_list:      2
+            Pid:    50811
+            Cpus_allowed_list:      3
+            Pid:    50812
+            Cpus_allowed_list:      4
+            Pid:    50813
+            Cpus_allowed_list:      5
+            Pid:    50814
+            Cpus_allowed_list:      6
+            Pid:    50815
+            Cpus_allowed_list:      7
+            cat@lubancat:~$ 
+
+            然后得到每个线程的CPU位置
+
+            gdb -q -batch -p 50761 \
+                -ex 'thread apply all bt 8'  # 最后通过GDB只读调用栈确认线程身份  50809～50815 → libgomp.so
+
+        为什么V2单线程没事呢？因为V2是计算单线程，而其他的FASTDDS接受发布都是分布在不同的CPU上的。
+
+        v3导致这样的原因主要是：
+            进程启动时存在：
+            OMP_PLACES={'{0},{1},{2},{3},{4},{5},{6},{7}'}
+            OMP_PROC_BIND=CLOSE  # 紧密排放
+            第一个OMP线程和主线程是一个线程，所以不是保留一个主线程 + 8个新OMP线程这种结构，所以主线程落在了CPU0
+
+
+
+
+
+
+        cat@lubancat:~$ lscpu -e
+        CPU SOCKET CORE L1d:L1i:L2:L3 ONLINE    MAXMHZ   MINMHZ MHZ
+        0      0    0 0:0:0:0           是 1800.0000 408.0000   -
+        1      0    1 1:1:1:0           是 1800.0000 408.0000   -
+        2      0    2 2:2:2:0           是 1800.0000 408.0000   -
+        3      0    3 3:3:3:0           是 1800.0000 408.0000   -
+        4      0    0 4:4:4:0           是 2304.0000 408.0000   -
+        5      0    1 5:5:5:0           是 2304.0000 408.0000   -
+        6      0    2 6:6:6:0           是 2304.0000 408.0000   -
+        7      0    3 7:7:7:0           是 2304.0000 408.0000   -
+        
+        cat@lubancat:~$ 
         | 模式       | 线程/CPU集合 | Core p95 | Voxel p95   | Callback p95 | Core加速比 | CPU% | 温度 |
         | V2 Scalar | 标量         | 4.272    | 6.408       | 10.859       | 1.00×      | *   | *   |
         | V3 OMP    | 1/大核       | *        | *           | *             | *         | *   | *   |
@@ -258,14 +375,8 @@
         | V3 OMP    | 8/全核       | *           | *        | *             | *         | *   | *   |
 
 
+
         v4: PERF V4_NEON samples=1000 core_p95=1.243 ms voxel_p95=6.345 ms callback_p95=7.769 ms
-
-
-
-
-
-
-
 
 
 
@@ -280,3 +391,9 @@
                 tryAppendPointsNeon4
             }
         }
+
+
+
+
+
+        [pcl_obstacle_node-3] [INFO] [1788076402.613428838] [pcl_obstacle_node]: PERF PCL_WORK input_pts_n=1000 input_pts_p50=6888 input_pts_p95=7082 input_pts_p99=7171 near_ground_pts_n=1000 near_ground_pts_p50=117 near_ground_pts_p95=918 near_ground_pts_p99=1073 ground_pts_n=1000 ground_pts_p50=879 ground_pts_p95=1259 ground_pts_p99=1432 obstacle_pts_n=1000 obstacle_pts_p50=6038 obstacle_pts_p95=6956 obstacle_pts_p99=7082 cluster_candidates_n=1000 cluster_candidates_p50=2 cluster_candidates_p95=5 cluster_candidates_p99=5 published_clusters_n=1000 published_clusters_p50=2 published_clusters_p95=5 published_clusters_p99=5 clustered_pts_n=1000 clustered_pts_p50=6020 clustered_pts_p95=6949 clustered_pts_p99=7079 bbox_message_p95=0.062 obstacle_publish_call_p95=0.128 ground_paths ransac_ok=785 too_few=215 ransac_failed=0 direct_height=0 empty_input=0 failed=0
