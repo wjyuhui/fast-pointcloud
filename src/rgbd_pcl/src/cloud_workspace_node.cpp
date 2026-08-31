@@ -439,6 +439,20 @@ inline uint32x4_t finiteMask(const float32x4_t z)
   return vmvnq_u32(vceqq_u32(exponent, vdupq_n_u32(0x7F800000u)));
 }
 
+inline void appendFourPointsNeon(
+  CloudT & cloud,
+  const float32x4_t x,
+  const float32x4_t y,
+  const float32x4_t z)
+{
+  const size_t first = cloud.points.size();
+  cloud.points.resize(first + 4U);
+  const float32x4x4_t xyzw{
+    x, y, z, vdupq_n_f32(1.0f)
+  };
+  vst4q_f32(cloud.points[first].data, xyzw);
+}
+
 inline void appendTransformedPointsNeon4(
   CloudT & cloud,
   const float32x4_t z,
@@ -475,15 +489,27 @@ inline void appendTransformedPointsNeon4(
       vcleq_f32(z_target, vdupq_n_f32(params.zmax_roi))));
   const uint32x4_t valid_mask = vandq_u32(depth_valid, roi_valid);
 
-  uint32x4_t voxel_boundary_mask = vdupq_n_u32(0U);
+  uint32x4_t precise_recheck_mask = vdupq_n_u32(0U);
   if (precise_params != nullptr && precise_params->voxel_leaf > 0.0f) {
+    constexpr float kPreciseBoundaryBand = 0.002f;
+    const uint32x4_t roi_boundary_mask = vorrq_u32(
+      vorrq_u32(
+        vcleq_f32(vabdq_f32(x_target, vdupq_n_f32(params.xmin)),
+          vdupq_n_f32(kPreciseBoundaryBand)),
+        vcleq_f32(vabdq_f32(x_target, vdupq_n_f32(params.xmax)),
+          vdupq_n_f32(kPreciseBoundaryBand))),
+      vorrq_u32(
+        vcleq_f32(vabdq_f32(z_target, vdupq_n_f32(params.zmin_roi)),
+          vdupq_n_f32(kPreciseBoundaryBand)),
+        vcleq_f32(vabdq_f32(z_target, vdupq_n_f32(params.zmax_roi)),
+          vdupq_n_f32(kPreciseBoundaryBand))));
     const float inverse_leaf = 1.0f / precise_params->voxel_leaf;
     constexpr float kPreciseVoxelBoundaryBand = 0.0001f;
     const float threshold_in_voxels = kPreciseVoxelBoundaryBand * inverse_leaf;
     const float32x4_t x_scaled = vmulq_n_f32(x_target, inverse_leaf);
     const float32x4_t y_scaled = vmulq_n_f32(y_target, inverse_leaf);
     const float32x4_t z_scaled = vmulq_n_f32(z_target, inverse_leaf);
-    voxel_boundary_mask = vorrq_u32(
+    const uint32x4_t voxel_boundary_mask = vorrq_u32(
       vcleq_f32(vabdq_f32(x_scaled, vrndnq_f32(x_scaled)),
         vdupq_n_f32(threshold_in_voxels)),
       vorrq_u32(
@@ -491,30 +517,38 @@ inline void appendTransformedPointsNeon4(
           vdupq_n_f32(threshold_in_voxels)),
         vcleq_f32(vabdq_f32(z_scaled, vrndnq_f32(z_scaled)),
           vdupq_n_f32(threshold_in_voxels))));
+    precise_recheck_mask = vorrq_u32(
+      roi_boundary_mask, voxel_boundary_mask);
+  }
+
+  const bool needs_precise_recheck =
+    precise_params != nullptr && vmaxvq_u32(precise_recheck_mask) != 0U;
+  if (!needs_precise_recheck && vminvq_u32(valid_mask) == std::numeric_limits<uint32_t>::max()) {
+    appendFourPointsNeon(cloud, x_target, y_target, z_target);
+    return;
+  }
+  if (!needs_precise_recheck && vmaxvq_u32(valid_mask) == 0U) {
+    return;
   }
 
   alignas(16) float xs[4];
   alignas(16) float ys[4];
   alignas(16) float zs[4];
-  alignas(16) float depths[4];
   alignas(16) uint32_t valid[4];
-  alignas(16) uint32_t near_voxel_boundary[4];
   vst1q_f32(xs, x_target);
   vst1q_f32(ys, y_target);
   vst1q_f32(zs, z_target);
-  vst1q_f32(depths, z);
   vst1q_u32(valid, valid_mask);
-  vst1q_u32(near_voxel_boundary, voxel_boundary_mask);
+
+  alignas(16) float depths[4];
+  alignas(16) uint32_t precise_recheck[4];
+  if (precise_params != nullptr) {
+    vst1q_f32(depths, z);
+    vst1q_u32(precise_recheck, precise_recheck_mask);
+  }
 
   for (size_t lane = 0; lane < 4; ++lane) {
-    constexpr float kPreciseBoundaryBand = 0.002f;
-    const bool needs_precise_recheck =
-      std::abs(xs[lane] - params.xmin) <= kPreciseBoundaryBand ||
-      std::abs(xs[lane] - params.xmax) <= kPreciseBoundaryBand ||
-      std::abs(zs[lane] - params.zmin_roi) <= kPreciseBoundaryBand ||
-      std::abs(zs[lane] - params.zmax_roi) <= kPreciseBoundaryBand ||
-      near_voxel_boundary[lane] != 0U;
-    if (precise_params != nullptr && needs_precise_recheck) {
+    if (precise_params != nullptr && precise_recheck[lane] != 0U) {
       const float depth = depths[lane];
       if (!std::isfinite(depth) || depth < params.zmin || depth > params.zmax) {
         continue;
@@ -540,7 +574,7 @@ inline void appendTransformedPointsNeon4(
       p.x = exact_x;
       p.y = exact_y;
       p.z = exact_z;
-      cloud.push_back(p);
+      cloud.points.push_back(p);
       continue;
     }
     if (valid[lane] != 0U) {
@@ -548,9 +582,39 @@ inline void appendTransformedPointsNeon4(
       p.x = xs[lane];
       p.y = ys[lane];
       p.z = zs[lane];
-      cloud.push_back(p);
+      cloud.points.push_back(p);
     }
   }
+}
+
+inline void tryAppendPointsNeon4Contiguous(
+  CloudT & cloud,
+  const uint16_t * row,
+  const size_t ui,
+  const size_t vi,
+  const float * ray_x,
+  const float * ray_y,
+  const NeonWorkspaceParams & params,
+  const PreciseNeonWorkspaceParams * precise_params = nullptr)
+{
+  const uint32x4_t raw = vmovl_u16(vld1_u16(row + ui));
+  const float32x4_t z = vmulq_n_f32(vcvtq_f32_u32(raw), 0.001f);
+  appendTransformedPointsNeon4(
+    cloud, z, ui, vi, ray_x, ray_y, params, precise_params);
+}
+
+inline void tryAppendPointsNeon4Contiguous(
+  CloudT & cloud,
+  const float * row,
+  const size_t ui,
+  const size_t vi,
+  const float * ray_x,
+  const float * ray_y,
+  const NeonWorkspaceParams & params,
+  const PreciseNeonWorkspaceParams * precise_params = nullptr)
+{
+  appendTransformedPointsNeon4(
+    cloud, vld1q_f32(row + ui), ui, vi, ray_x, ray_y, params, precise_params);
 }
 
 inline void tryAppendPointsNeon4(
@@ -937,14 +1001,17 @@ private:
   {
     const char * affinity_ok = (compute_affinity_valid_ && omp_affinity_valid_) ? "true" : "false";
     if (projection_fuse_voxel_) {
+      const char * version = projection_enable_neon_ ?
+        "V7_NEON_OMP" : "V5_PCL_EQUIV_OMP";
       RCLCPP_INFO(
         get_logger(),
-        "PERF V5_PCL_EQUIV_OMP neon=%s requested_threads=%d actual_threads=%d "
+        "PERF %s neon=%s requested_threads=%d actual_threads=%d "
         "affinity_ok=%s samples=%zu core_p95=%.3f ms minmax_p95=%.3f ms "
         "index_p95=%.3f ms sort_p95=%.3f ms group_p95=%.3f ms "
         "centroid_p95=%.3f ms voxel_p95=%.3f ms compute_total_p95=%.3f ms "
         "callback_p95=%.3f ms queue_wait_p95=%.3f ms input_pts_p95=%.0f "
         "output_voxels_p95=%.0f submitted=%lu processed=%lu dropped_pending=%lu",
+        version,
         projection_enable_neon_ ? "true" : "false",
         projection_openmp_threads_,
         omp_actual_threads_,
@@ -968,7 +1035,7 @@ private:
       if (!compute_affinity_valid_ || !omp_affinity_valid_) {
         RCLCPP_WARN(
           get_logger(),
-          "PERF V5_PCL_EQUIV_OMP result is invalid because compute/OpenMP affinity failed");
+          "PERF %s result is invalid because compute/OpenMP affinity failed", version);
       }
     } else if (projection_enable_openmp_) {
       RCLCPP_INFO(
@@ -996,7 +1063,7 @@ private:
     } else if (projection_enable_neon_) {
       RCLCPP_INFO(
         get_logger(),
-        "PERF V4_NEON affinity_ok=%s samples=%zu "
+        "PERF V6_NEON_CONTIG affinity_ok=%s samples=%zu "
         "queue_wait_p95=%.3f ms core_p95=%.3f ms voxel_p95=%.3f ms compute_total_p95=%.3f ms callback_p95=%.3f ms "
         "submitted=%lu processed=%lu dropped_pending=%lu",
         affinity_ok,
@@ -1012,7 +1079,7 @@ private:
       if (!compute_affinity_valid_) {
         RCLCPP_WARN(
           get_logger(),
-          "PERF V4_NEON result is invalid because compute-thread affinity failed");
+          "PERF V6_NEON_CONTIG result is invalid because compute-thread affinity failed");
       }
     } else {
       RCLCPP_INFO(
@@ -2284,7 +2351,13 @@ private:
         static_cast<double>(std::abs(actual.z - reference.z)));
     }
 
-    constexpr double kCentroidTolerance = 1e-5;
+    // With stride=1, a voxel can contain roughly four times as many points as
+    // stride=2. The NEON float transform and scalar double reference can differ
+    // by a few final ulps. Exact boundary rechecks keep voxel membership
+    // identical, but dense-voxel centroids can accumulate that tiny coordinate
+    // difference. Keep the tolerance far below sensor precision while still
+    // requiring identical output count, voxel keys, and voxel order.
+    constexpr double kCentroidTolerance = 5e-5;
     if (order_ok && max_coordinate_error <= kCentroidTolerance) {
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 2000,
@@ -2414,10 +2487,18 @@ private:
           size_t ui = 0;
 #if RGBD_PCL_HAS_NEON
           if (use_neon) {
-            for (; ui + 3U < sampled_cols; ui += 4U) {
-              tryAppendPointsNeon4(
-                local_cloud, row, ui, vi, stride, ray_x, ray_y,
-                neon_params, &precise_neon_params);
+            if (stride == 1) {
+              for (; ui + 3U < sampled_cols; ui += 4U) {
+                tryAppendPointsNeon4Contiguous(
+                  local_cloud, row, ui, vi, ray_x, ray_y,
+                  neon_params, &precise_neon_params);
+              }
+            } else {
+              for (; ui + 3U < sampled_cols; ui += 4U) {
+                tryAppendPointsNeon4(
+                  local_cloud, row, ui, vi, stride, ray_x, ray_y,
+                  neon_params, &precise_neon_params);
+              }
             }
           }
 #endif
@@ -2437,10 +2518,18 @@ private:
           size_t ui = 0;
 #if RGBD_PCL_HAS_NEON
           if (use_neon) {
-            for (; ui + 3U < sampled_cols; ui += 4U) {
-              tryAppendPointsNeon4(
-                local_cloud, row, ui, vi, stride, ray_x, ray_y,
-                neon_params, &precise_neon_params);
+            if (stride == 1) {
+              for (; ui + 3U < sampled_cols; ui += 4U) {
+                tryAppendPointsNeon4Contiguous(
+                  local_cloud, row, ui, vi, ray_x, ray_y,
+                  neon_params, &precise_neon_params);
+              }
+            } else {
+              for (; ui + 3U < sampled_cols; ui += 4U) {
+                tryAppendPointsNeon4(
+                  local_cloud, row, ui, vi, stride, ray_x, ray_y,
+                  neon_params, &precise_neon_params);
+              }
             }
           }
 #endif
@@ -2529,7 +2618,6 @@ private:
       static_cast<float>(r10), static_cast<float>(r11), static_cast<float>(r12), static_cast<float>(ty),
       static_cast<float>(r20), static_cast<float>(r21), static_cast<float>(r22), static_cast<float>(tz)
     };
-
     cloud_roi.clear();
     cloud_roi.reserve(sampled_rows * sampled_cols);
 
@@ -2540,8 +2628,14 @@ private:
           depth.data.data() + static_cast<size_t>(v) * depth.step);
 
         size_t ui = 0;
-        for (; ui + 3 < sampled_cols; ui += 4) {
-          tryAppendPointsNeon4(cloud_roi, row, ui, vi, stride, ray_x, ray_y, params);
+        if (stride == 1) {
+          for (; ui + 3 < sampled_cols; ui += 4) {
+            tryAppendPointsNeon4Contiguous(cloud_roi, row, ui, vi, ray_x, ray_y, params);
+          }
+        } else {
+          for (; ui + 3 < sampled_cols; ui += 4) {
+            tryAppendPointsNeon4(cloud_roi, row, ui, vi, stride, ray_x, ray_y, params);
+          }
         }
         for (; ui < sampled_cols; ++ui) {
           const int u = static_cast<int>(ui) * stride;
@@ -2558,8 +2652,14 @@ private:
           depth.data.data() + static_cast<size_t>(v) * depth.step);
 
         size_t ui = 0;
-        for (; ui + 3 < sampled_cols; ui += 4) {
-          tryAppendPointsNeon4(cloud_roi, row, ui, vi, stride, ray_x, ray_y, params);
+        if (stride == 1) {
+          for (; ui + 3 < sampled_cols; ui += 4) {
+            tryAppendPointsNeon4Contiguous(cloud_roi, row, ui, vi, ray_x, ray_y, params);
+          }
+        } else {
+          for (; ui + 3 < sampled_cols; ui += 4) {
+            tryAppendPointsNeon4(cloud_roi, row, ui, vi, stride, ray_x, ray_y, params);
+          }
         }
         for (; ui < sampled_cols; ++ui) {
           const int u = static_cast<int>(ui) * stride;

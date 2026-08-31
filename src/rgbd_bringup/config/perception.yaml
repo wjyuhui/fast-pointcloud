@@ -9,7 +9,7 @@ cloud_workspace_node:
     camera_info_topic: /camera/color/camera_info
     output_cloud_topic: /perception/cloud_workspace
     target_frame: base_link
-    depth_stride: 2
+    depth_stride: 1
     min_depth_m: 0.2
     max_depth_m: 5.0
     passthrough_x_min: 0.2

@@ -397,3 +397,10 @@
 
 
         [pcl_obstacle_node-3] [INFO] [1788076402.613428838] [pcl_obstacle_node]: PERF PCL_WORK input_pts_n=1000 input_pts_p50=6888 input_pts_p95=7082 input_pts_p99=7171 near_ground_pts_n=1000 near_ground_pts_p50=117 near_ground_pts_p95=918 near_ground_pts_p99=1073 ground_pts_n=1000 ground_pts_p50=879 ground_pts_p95=1259 ground_pts_p99=1432 obstacle_pts_n=1000 obstacle_pts_p50=6038 obstacle_pts_p95=6956 obstacle_pts_p99=7082 cluster_candidates_n=1000 cluster_candidates_p50=2 cluster_candidates_p95=5 cluster_candidates_p99=5 published_clusters_n=1000 published_clusters_p50=2 published_clusters_p95=5 published_clusters_p99=5 clustered_pts_n=1000 clustered_pts_p50=6020 clustered_pts_p95=6949 clustered_pts_p99=7079 bbox_message_p95=0.062 obstacle_publish_call_p95=0.128 ground_paths ransac_ok=785 too_few=215 ransac_failed=0 direct_height=0 empty_input=0 failed=0
+
+
+
+stride 2 voxel 0.05:
+V2完成：core=2.945 ms、voxel=8.302 ms、callback=13.852 ms，本轮bag存在22次latest-frame覆盖，PCL p95为3.878 ms。接下来测试V3 1线程大核CPU7，然后依次增加组合。
+
+
